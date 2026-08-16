@@ -6,6 +6,8 @@ ProcWire is a defensive Linux observability TUI written in Go. It starts with li
 
 ProcWire is under active development. Network socket state currently comes from procfs, while the DNS tab uses native eBPF programs attached to cgroup ingress and egress paths.
 
+![ProcWire inbound session view](docs/procwire-tui.png)
+
 ## Current Capabilities
 
 - Native Charm interface built with Bubble Tea, Bubbles, and Lip Gloss.
