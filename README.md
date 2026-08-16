@@ -43,6 +43,28 @@ These labels deliberately do not say “malware” or “official.” A package 
 
 The Integrity tab is broader than the real `debsums -s`: it also includes unowned local files, generated entries, and files that cannot be checked safely. ProcWire implements this natively so `debsums` does not need to be installed.
 
+## Quick Start
+
+Download the `v0.1.0` binary for your Linux architecture:
+
+### AMD64 / x86_64
+
+```sh
+curl -fL https://github.com/xhzeem/procwire/releases/download/v0.1.0/procwire-linux-amd64 -o procwire
+chmod +x procwire
+sudo ./procwire
+```
+
+### ARM64 / AArch64
+
+```sh
+curl -fL https://github.com/xhzeem/procwire/releases/download/v0.1.0/procwire-linux-arm64 -o procwire
+chmod +x procwire
+sudo ./procwire
+```
+
+Root access activates system-wide DNS eBPF capture and provides broader process attribution. ProcWire can run without root, but the DNS tab will be marked degraded when the required BPF and cgroup permissions are unavailable.
+
 ## Run
 
 ProcWire targets Linux. Run it as root, or with equivalent BPF and cgroup capabilities, to activate system-wide DNS capture. Without those privileges, the same app remains usable and marks only the DNS tab as degraded; procfs network visibility depends on ordinary `/proc` permissions.
