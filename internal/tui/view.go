@@ -308,7 +308,7 @@ func (m Model) statusLine(width int) string {
 			parts = append(parts, "waiting for plaintext DNS on UDP/TCP 53")
 		}
 		if m.dnsWarningCount > 0 {
-			parts = append(parts, fmt.Sprintf("%d skipped/dropped packets", m.dnsWarningCount))
+			parts = append(parts, fmt.Sprintf("%d DNS monitor/parser warnings", m.dnsWarningCount))
 		}
 		if m.dnsWarning != "" {
 			parts = append(parts, m.dnsWarning)

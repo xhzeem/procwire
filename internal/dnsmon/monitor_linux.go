@@ -69,13 +69,18 @@ func (monitor *ebpfMonitor) Start() error {
 	}
 	monitor.events = events
 
-	egress, err := ebpf.NewProgram(dnsProgramSpec(events, 0, ebpf.AttachCGroupInetEgress))
+	pidAttribution := true
+	egress, err := ebpf.NewProgram(dnsProgramSpec(events, 0, ebpf.AttachCGroupInetEgress, pidAttribution))
+	if err != nil && unsupportedCurrentPIDHelper(err) {
+		pidAttribution = false
+		egress, err = ebpf.NewProgram(dnsProgramSpec(events, 0, ebpf.AttachCGroupInetEgress, pidAttribution))
+	}
 	if err != nil {
 		monitor.Close()
 		return fmt.Errorf("load DNS egress eBPF program: %w", err)
 	}
 	monitor.egress = egress
-	ingress, err := ebpf.NewProgram(dnsProgramSpec(events, 1, ebpf.AttachCGroupInetIngress))
+	ingress, err := ebpf.NewProgram(dnsProgramSpec(events, 1, ebpf.AttachCGroupInetIngress, false))
 	if err != nil {
 		monitor.Close()
 		return fmt.Errorf("load DNS ingress eBPF program: %w", err)
@@ -107,7 +112,23 @@ func (monitor *ebpfMonitor) Start() error {
 	monitor.reader = reader
 	monitor.wait.Add(1)
 	go monitor.readLoop()
+	if !pidAttribution {
+		monitor.sendError(errors.New("kernel disallows bpf_get_current_pid_tgid for cgroup DNS capture; continuing without DNS PID/process attribution"))
+	}
 	return nil
+}
+
+func unsupportedCurrentPIDHelper(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	if !strings.Contains(message, "bpf_get_current_pid_tgid") && !strings.Contains(message, "func #14") {
+		return false
+	}
+	return strings.Contains(message, "unknown func") ||
+		strings.Contains(message, "invalid func") ||
+		strings.Contains(message, "cannot use helper")
 }
 
 func (monitor *ebpfMonitor) Packets() <-chan Packet { return monitor.packets }
@@ -272,7 +293,7 @@ func detectCgroupPath() (string, error) {
 	return "", ErrUnsupported
 }
 
-func dnsProgramSpec(events *ebpf.Map, direction byte, attach ebpf.AttachType) *ebpf.ProgramSpec {
+func dnsProgramSpec(events *ebpf.Map, direction byte, attach ebpf.AttachType, pidAttribution bool) *ebpf.ProgramSpec {
 	name := "pw_dns_egress"
 	if direction == 1 {
 		name = "pw_dns_ingress"
@@ -282,11 +303,11 @@ func dnsProgramSpec(events *ebpf.Map, direction byte, attach ebpf.AttachType) *e
 		Type:         ebpf.CGroupSKB,
 		AttachType:   attach,
 		License:      "GPL",
-		Instructions: dnsInstructions(events, direction),
+		Instructions: dnsInstructions(events.FD(), direction, pidAttribution),
 	}
 }
 
-func dnsInstructions(events *ebpf.Map, direction byte) asm.Instructions {
+func dnsInstructions(eventsFD int, direction byte, pidAttribution bool) asm.Instructions {
 	instructions := asm.Instructions{asm.Mov.Reg(asm.R6, asm.R1)}
 	instructions = append(instructions, loadPacketImmediate(0, asm.Byte, "", "allow")...)
 	instructions = append(instructions,
@@ -370,7 +391,7 @@ func dnsInstructions(events *ebpf.Map, direction byte) asm.Instructions {
 		asm.JEq.Imm(asm.R0, 0, "allow").WithSymbol("length_bounded"),
 		asm.StoreMem(asm.RFP, -16, asm.R0, asm.Word),
 
-		asm.LoadMapPtr(asm.R1, events.FD()),
+		asm.LoadMapPtr(asm.R1, eventsFD),
 		asm.Mov.Imm(asm.R2, dnsEventSize),
 		asm.Mov.Imm(asm.R3, 0),
 		asm.FnRingbufReserve.Call(),
@@ -408,11 +429,17 @@ func dnsInstructions(events *ebpf.Map, direction byte) asm.Instructions {
 		instructions = append(instructions,
 			asm.FnGetCurrentCgroupId.Call(),
 			asm.StoreMem(asm.R7, 8, asm.R0, asm.DWord),
-			asm.FnGetCurrentPidTgid.Call(),
-			asm.StoreMem(asm.R7, 28, asm.R0, asm.Word),
-			asm.Mov.Reg(asm.R1, asm.R0),
-			asm.RSh.Imm(asm.R1, 32),
-			asm.StoreMem(asm.R7, 24, asm.R1, asm.Word),
+		)
+		if pidAttribution {
+			instructions = append(instructions,
+				asm.FnGetCurrentPidTgid.Call(),
+				asm.StoreMem(asm.R7, 28, asm.R0, asm.Word),
+				asm.Mov.Reg(asm.R1, asm.R0),
+				asm.RSh.Imm(asm.R1, 32),
+				asm.StoreMem(asm.R7, 24, asm.R1, asm.Word),
+			)
+		}
+		instructions = append(instructions,
 			asm.Mov.Reg(asm.R1, asm.R6),
 			asm.FnGetSocketUid.Call(),
 			asm.StoreMem(asm.R7, 32, asm.R0, asm.Word),

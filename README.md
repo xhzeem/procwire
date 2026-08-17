@@ -47,12 +47,12 @@ The Integrity tab is broader than the real `debsums -s`: it also includes unowne
 
 ## Quick Start
 
-Download the `v0.1.0` binary for your Linux architecture:
+Download the `v0.1.1` binary for your Linux architecture:
 
 ### AMD64 / x86_64
 
 ```sh
-curl -fL https://github.com/xhzeem/procwire/releases/download/v0.1.0/procwire-linux-amd64 -o procwire
+curl -fL https://github.com/xhzeem/procwire/releases/download/v0.1.1/procwire-linux-amd64 -o procwire
 chmod +x procwire
 sudo ./procwire
 ```
@@ -60,7 +60,7 @@ sudo ./procwire
 ### ARM64 / AArch64
 
 ```sh
-curl -fL https://github.com/xhzeem/procwire/releases/download/v0.1.0/procwire-linux-arm64 -o procwire
+curl -fL https://github.com/xhzeem/procwire/releases/download/v0.1.1/procwire-linux-arm64 -o procwire
 chmod +x procwire
 sudo ./procwire
 ```
@@ -142,6 +142,7 @@ The generator publishes a JSON fixture manifest instead of sharing hardcoded por
 - Procfs polling can miss short-lived connections between snapshots.
 - Only the current network namespace is inspected; separate container namespaces are not traversed yet.
 - DNS visibility covers plaintext UDP/TCP port 53. DoH and DoT are encrypted, and TCP messages split across packets are not reassembled yet.
+- Kernels that reject `bpf_get_current_pid_tgid` for cgroup-skb programs fall back to DNS capture without PID/process attribution.
 - The DNS Current view is an observed TTL cache plus `/etc/hosts`, not a dump of every resolver daemon's pre-existing cache. History begins when ProcWire starts.
 - DNS packet parsing currently handles normal IPv4 and IPv6 headers, but not IPv4 fragments or IPv6 extension-header chains.
 - Traffic byte and packet rates are not available from the current procfs collector.
