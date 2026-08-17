@@ -4,7 +4,7 @@
 
 ProcWire is a defensive Linux observability TUI written in Go. It starts with live and retained network activity, correlates sockets and DNS requests with processes and systemd services, inventories persistence mechanisms, and records the session as JSONL in the directory where it was launched.
 
-ProcWire is under active development. Network socket state currently comes from procfs, while the DNS tab uses native eBPF programs attached to cgroup ingress and egress paths.
+ProcWire is under active development. Network socket state currently comes from procfs, while the DNS tab prefers native eBPF programs attached to cgroup ingress and egress paths and falls back to a raw packet socket when the kernel rejects them.
 
 ![ProcWire inbound session view](docs/procwire-tui.png)
 
@@ -18,6 +18,7 @@ ProcWire is under active development. Network socket state currently comes from 
 - PID, process name, executable, command line, user, and systemd cgroup attribution.
 - System-wide plaintext DNS query and response capture through pure-Go eBPF with process attribution.
 - eBPF instructions assembled and loaded in-process, with no Clang, libbpf, libpcap, or sidecar binary required.
+- Automatic pure-Go `AF_PACKET` fallback for kernels or sandboxes that reject the eBPF programs.
 - A DNS tab with an alphabetically stable Current cache and a retained event-by-event History, plus TTL-aware observed answers, `/etc/hosts` entries, and DNS-derived network destination names.
 - Dedicated open-port view for TCP listeners and unconnected UDP bound sockets.
 - Inventory of system and user systemd services, timers, sockets, paths, mounts, automounts, swaps, drop-ins, masks, and shadowed definitions.
@@ -47,12 +48,12 @@ The Integrity tab is broader than the real `debsums -s`: it also includes unowne
 
 ## Quick Start
 
-Download the `v0.1.1` binary for your Linux architecture:
+Download the `v0.1.2` binary for your Linux architecture:
 
 ### AMD64 / x86_64
 
 ```sh
-curl -fL https://github.com/xhzeem/procwire/releases/download/v0.1.1/procwire-linux-amd64 -o procwire
+curl -fL https://github.com/xhzeem/procwire/releases/download/v0.1.2/procwire-linux-amd64 -o procwire
 chmod +x procwire
 sudo ./procwire
 ```
@@ -60,16 +61,16 @@ sudo ./procwire
 ### ARM64 / AArch64
 
 ```sh
-curl -fL https://github.com/xhzeem/procwire/releases/download/v0.1.1/procwire-linux-arm64 -o procwire
+curl -fL https://github.com/xhzeem/procwire/releases/download/v0.1.2/procwire-linux-arm64 -o procwire
 chmod +x procwire
 sudo ./procwire
 ```
 
-Root access activates system-wide DNS eBPF capture and provides broader process attribution. ProcWire can run without root, but the DNS tab will be marked degraded when the required BPF and cgroup permissions are unavailable.
+Root access activates system-wide DNS eBPF capture and provides broader process attribution. If eBPF is unavailable but `CAP_NET_RAW` is permitted, ProcWire automatically captures DNS through `AF_PACKET` without reliable PID/cgroup attribution. The DNS tab is degraded only when neither backend can start.
 
 ## Run
 
-ProcWire targets Linux. Run it as root, or with equivalent BPF and cgroup capabilities, to activate system-wide DNS capture. Without those privileges, the same app remains usable and marks only the DNS tab as degraded; procfs network visibility depends on ordinary `/proc` permissions.
+ProcWire targets Linux. Run it as root, or with equivalent BPF and cgroup capabilities, to activate system-wide DNS capture with process attribution. `CAP_NET_RAW` is sufficient for the lower-attribution `AF_PACKET` fallback. Without either permission set, the same app remains usable and marks only the DNS tab as degraded; procfs network visibility depends on ordinary `/proc` permissions.
 
 ```sh
 ./procwire
@@ -142,7 +143,7 @@ The generator publishes a JSON fixture manifest instead of sharing hardcoded por
 - Procfs polling can miss short-lived connections between snapshots.
 - Only the current network namespace is inspected; separate container namespaces are not traversed yet.
 - DNS visibility covers plaintext UDP/TCP port 53. DoH and DoT are encrypted, and TCP messages split across packets are not reassembled yet.
-- Kernels that reject `bpf_get_current_pid_tgid` for cgroup-skb programs fall back to DNS capture without PID/process attribution.
+- Kernel helper incompatibilities first retry reduced-attribution eBPF; other eBPF load failures fall back to `AF_PACKET` in the current network namespace without reliable PID/cgroup attribution.
 - The DNS Current view is an observed TTL cache plus `/etc/hosts`, not a dump of every resolver daemon's pre-existing cache. History begins when ProcWire starts.
 - DNS packet parsing currently handles normal IPv4 and IPv6 headers, but not IPv4 fragments or IPv6 extension-header chains.
 - Traffic byte and packet rates are not available from the current procfs collector.

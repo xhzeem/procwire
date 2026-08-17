@@ -49,12 +49,77 @@ type cachedProcess struct {
 	expiresAt time.Time
 }
 
+type adaptiveMonitor struct {
+	active PacketMonitor
+}
+
 func NewMonitor() PacketMonitor {
+	return &adaptiveMonitor{}
+}
+
+func newEBPFMonitor() *ebpfMonitor {
 	return &ebpfMonitor{
 		packets:   make(chan Packet, packetQueueSize),
 		errors:    make(chan error, 64),
 		processes: make(map[int]cachedProcess),
 	}
+}
+
+func (monitor *adaptiveMonitor) Start() error {
+	ebpfBackend := newEBPFMonitor()
+	ebpfErr := ebpfBackend.Start()
+	if ebpfErr == nil {
+		monitor.active = ebpfBackend
+		return nil
+	}
+	_ = ebpfBackend.Close()
+	packetBackend := newAFPacketMonitor()
+	if packetErr := packetBackend.Start(); packetErr != nil {
+		_ = packetBackend.Close()
+		return errors.Join(
+			fmt.Errorf("start eBPF DNS backend: %w", ebpfErr),
+			fmt.Errorf("start AF_PACKET DNS fallback: %w", packetErr),
+		)
+	}
+	monitor.active = packetBackend
+	packetBackend.sendError(fmt.Errorf(
+		"eBPF DNS backend unavailable (%s); using AF_PACKET without PID/process attribution",
+		conciseMonitorError(ebpfErr),
+	))
+	return nil
+}
+
+func (monitor *adaptiveMonitor) Packets() <-chan Packet {
+	if monitor.active == nil {
+		return nil
+	}
+	return monitor.active.Packets()
+}
+
+func (monitor *adaptiveMonitor) Errors() <-chan error {
+	if monitor.active == nil {
+		return nil
+	}
+	return monitor.active.Errors()
+}
+
+func (monitor *adaptiveMonitor) Close() error {
+	if monitor.active == nil {
+		return nil
+	}
+	return monitor.active.Close()
+}
+
+func conciseMonitorError(err error) string {
+	message := strings.TrimSpace(err.Error())
+	if index := strings.IndexByte(message, '\n'); index >= 0 {
+		message = message[:index]
+	}
+	const limit = 240
+	if len(message) > limit {
+		message = message[:limit-3] + "..."
+	}
+	return message
 }
 
 func (monitor *ebpfMonitor) Start() error {
@@ -459,6 +524,7 @@ func dnsInstructions(eventsFD int, direction byte, pidAttribution bool) asm.Inst
 		asm.Mov.Reg(asm.R3, asm.R7),
 		asm.Add.Imm(asm.R3, dnsPayloadStart),
 		asm.LoadMem(asm.R4, asm.RFP, -16, asm.Word),
+		asm.JEq.Imm(asm.R4, 0, "discard"),
 		asm.FnSkbLoadBytes.Call(),
 		asm.JSLT.Imm(asm.R0, 0, "discard"),
 		asm.Mov.Reg(asm.R1, asm.R7),
