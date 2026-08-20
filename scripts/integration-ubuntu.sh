@@ -34,7 +34,7 @@ docker run --rm --pull=never --platform "linux/$ARCH" --privileged --cgroupns=ho
   /bin/sh -c '
     stty rows 36 cols 120
     rm -f /work/fixture.json /work/fixture.json.tmp
-    /work/trafficgen \
+    LD_LIBRARY_PATH=/tmp/procwire-loader-check /work/trafficgen \
       --duration 9s \
       --activity-delay 6s \
       --manifest /work/fixture.json \

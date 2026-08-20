@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/xhzeem/procwire/integration/fixture"
 	"github.com/xhzeem/procwire/internal/dnsmon"
 	"github.com/xhzeem/procwire/internal/flow"
 	"github.com/xhzeem/procwire/internal/observe"
 	"github.com/xhzeem/procwire/internal/persistence"
+	"github.com/xhzeem/procwire/internal/runtimecheck"
 )
 
 type record struct {
@@ -38,6 +40,9 @@ type observations struct {
 	closedFlow          bool
 	repeatedObservation bool
 	modifiedPackageFile bool
+	processInventory    bool
+	liveSampling        bool
+	loaderOverride      bool
 	sessionEnd          bool
 }
 
@@ -114,6 +119,31 @@ func verify(path string, manifest fixture.Manifest) error {
 			if err := observePersistence(item.Data, manifest, seen); err != nil {
 				return err
 			}
+		case "process_observation":
+			var process runtimecheck.Process
+			if err := json.Unmarshal(item.Data, &process); err != nil {
+				return fmt.Errorf("decode process observation: %w", err)
+			}
+			if process.Name == manifest.ProcessName && process.PID > 0 && process.PPID > 0 && process.ID != "" {
+				seen.processInventory = true
+			}
+		case "runtime_sample_status":
+			var status struct {
+				Active  bool `json:"active"`
+				Sampled int  `json:"sampled"`
+			}
+			if err := json.Unmarshal(item.Data, &status); err != nil {
+				return fmt.Errorf("decode runtime sample status: %w", err)
+			}
+			seen.liveSampling = seen.liveSampling || status.Active && status.Sampled > 0
+		case "loader_finding":
+			var finding persistence.Finding
+			if err := json.Unmarshal(item.Data, &finding); err != nil {
+				return fmt.Errorf("decode loader finding: %w", err)
+			}
+			if finding.Mechanism == "loader environment" && strings.Contains(finding.Name, manifest.ProcessName) && strings.Contains(finding.Name, "LD_LIBRARY_PATH") {
+				seen.loaderOverride = true
+			}
 		case string(flow.EventOpened), string(flow.EventClosed):
 			if err := observeFlow(item, manifest, seen); err != nil {
 				return err
@@ -141,6 +171,9 @@ func verify(path string, manifest fixture.Manifest) error {
 		"all generated timer fixtures":   allTrue(seen.timers),
 		"all generated cron fixtures":    allTrue(seen.cron),
 		"modified package-owned fixture": seen.modifiedPackageFile,
+		"process hierarchy inventory":    seen.processInventory,
+		"live process sampling":          seen.liveSampling,
+		"loader environment override":    seen.loaderOverride,
 		"clean session end":              seen.sessionEnd,
 	}
 	missing := make([]string, 0)

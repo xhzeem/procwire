@@ -20,6 +20,7 @@ import (
 	"github.com/xhzeem/procwire/internal/flow"
 	"github.com/xhzeem/procwire/internal/observe"
 	"github.com/xhzeem/procwire/internal/persistence"
+	"github.com/xhzeem/procwire/internal/runtimecheck"
 )
 
 type findingItem struct {
@@ -70,6 +71,13 @@ func (delegate findingDelegate) Render(writer io.Writer, model list.Model, index
 	}
 	badgeText := provenanceLabel(finding.Provenance)
 	badge := delegate.styles.provenance(string(finding.Provenance)).Bold(true).Render("[" + badgeText + "]")
+	levelText, levelBadge := "   ", "   "
+	switch finding.Level {
+	case persistence.LevelWarning:
+		levelText, levelBadge = "!! ", delegate.styles.danger.Bold(true).Render("!! ")
+	case persistence.LevelReview:
+		levelText, levelBadge = " ! ", delegate.styles.warning.Bold(true).Render(" ! ")
+	}
 	name := finding.Unit
 	if name == "" {
 		name = finding.Name
@@ -79,8 +87,8 @@ func (delegate findingDelegate) Render(writer io.Writer, model list.Model, index
 	if model.Width() < 70 {
 		meta = finding.Mechanism
 	}
-	available := max(8, model.Width()-len(prefix)-len(badgeText)-len(meta)-8)
-	lineOne := prefix + badge + " " + delegate.styles.normal.Bold(selected).Render(truncatePlain(name, available))
+	available := max(8, model.Width()-len(prefix)-len(levelText)-len(badgeText)-len(meta)-8)
+	lineOne := prefix + levelBadge + badge + " " + delegate.styles.normal.Bold(selected).Render(truncatePlain(name, available))
 	if meta != "" {
 		lineOne += "  " + delegate.styles.muted.Render(meta)
 	}
@@ -126,7 +134,11 @@ func (m Model) headerView() string {
 		state = m.styles.danger.Bold(true).Render("DEGRADED")
 	case m.dnsErr != nil && m.activeTab == dnsTab:
 		state = m.styles.warning.Bold(true).Render("DNS DEGRADED")
-	case !m.lastSnapshot.IsZero() || !m.lastDNS.IsZero():
+	case m.runtimeScannerErr != nil && (m.activeTab == processesTab || m.activeTab == loaderTab):
+		state = m.styles.warning.Bold(true).Render("RUNTIME DEGRADED")
+	case m.scannerErr != nil && m.activeTab == persistenceTab:
+		state = m.styles.warning.Bold(true).Render("SCAN DEGRADED")
+	case !m.lastSnapshot.IsZero() || !m.lastDNS.IsZero() || !m.lastRuntimeScan.IsZero() || !m.lastSample.IsZero():
 		switch {
 		case isNetworkTab(m.activeTab):
 			direction := "OUTBOUND"
@@ -144,6 +156,22 @@ func (m Model) headerView() string {
 			state = m.styles.accent.Bold(true).Render("DNS CURRENT")
 		case m.activeTab == dnsTab:
 			state = m.styles.success.Bold(true).Render("DNS HISTORY")
+		case m.activeTab == persistenceTab && m.persistenceMode == persistenceIntegrityMode:
+			state = m.styles.warning.Bold(true).Render("PERSISTENCE INTEGRITY")
+		case m.activeTab == persistenceTab:
+			state = m.styles.success.Bold(true).Render("PERSISTENCE INVENTORY")
+		case m.activeTab == processesTab:
+			style := m.styles.success
+			if m.processMode == processRiskMode {
+				style = m.styles.danger
+			} else if m.processMode == processLiveMode {
+				style = m.styles.accent
+			}
+			state = style.Bold(true).Render("PROCESS " + m.processMode.label())
+		case m.activeTab == loaderTab && m.loaderMode == loaderAllMode:
+			state = m.styles.warning.Bold(true).Render("LOADER INTEGRITY")
+		case m.activeTab == loaderTab:
+			state = m.styles.warning.Bold(true).Render("LOADER " + m.loaderMode.label())
 		default:
 			state = m.styles.success.Bold(true).Render("MONITORING")
 		}
@@ -154,34 +182,109 @@ func (m Model) headerView() string {
 	}
 	top := alignSides(left, state+"  "+recording, width)
 
-	titles := []string{"1 INBOUND", "2 OUTBOUND", "3 DNS", "4 OPEN PORTS", "5 PERSISTENCE", "6 INTEGRITY"}
-	if width < 80 {
-		titles = []string{"1I", "2O", "3D", "4P", "5P", "6V"}
-	} else if width < 105 {
-		titles = []string{"1 IN", "2 OUT", "3 DNS", "4 PORTS", "5 PERSIST", "6 VERIFY"}
+	titles := []string{"1 INBOUND", "2 OUTBOUND", "3 DNS", "4 OPEN PORTS", "5 PERSISTENCE", "6 PROCESSES", "7 LOADER"}
+	if width < 100 {
+		titles = []string{"1I", "2O", "3D", "4N", "5P", "6X", "7L"}
+	} else if width < 135 {
+		titles = []string{"1 IN", "2 OUT", "3 DNS", "4 PORT", "5 PERS", "6 PROC", "7 LOAD"}
 	}
 	tabs := lipgloss.JoinHorizontal(lipgloss.Top,
 		m.renderTab(inboundTab, titles[0], m.networkCountFor(inboundTab)),
 		m.renderTab(outboundTab, titles[1], m.networkCountFor(outboundTab)),
 		m.renderTab(dnsTab, titles[2], m.dnsCount()),
 		m.renderTab(portsTab, titles[3], len(m.portFlows)),
-		m.renderTab(persistenceTab, titles[4], len(m.findings)),
-		m.renderTab(integrityTab, titles[5], len(m.integrityFindings)),
+		m.renderTab(persistenceTab, titles[4], m.persistenceCount()),
+		m.renderTab(processesTab, titles[5], m.processCount()),
+		m.renderTab(loaderTab, titles[6], m.loaderCount()),
 	)
 
-	statsLine := m.statsLine()
+	statsLine := truncateANSI(m.statsLine(), width)
 
 	status := m.statusLine(width)
 	lines := []string{top, tabs, statsLine, status}
 	if m.filtering {
 		lines = append(lines, m.filter.View())
-	} else if m.activeTab != persistenceTab && m.activeTab != integrityTab && m.filter.Value() != "" {
+	} else if m.activeTab != persistenceTab && m.activeTab != loaderTab && m.filter.Value() != "" {
 		lines = append(lines, m.styles.accent.Render("Filter: ")+m.styles.normal.Render(m.filter.Value())+m.styles.muted.Render("  c clears"))
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
 
 func (m Model) statsLine() string {
+	if m.activeTab == persistenceTab {
+		mode := m.styles.success.Bold(true).Render("INVENTORY")
+		if m.persistenceMode == persistenceIntegrityMode {
+			mode = m.styles.warning.Bold(true).Render("INTEGRITY")
+		}
+		return lipgloss.JoinHorizontal(lipgloss.Top,
+			m.styles.muted.Render("VIEW "), mode, "   ",
+			m.metric("ALL", len(m.findings), m.styles.success),
+			m.metric("CHECK", len(m.integrityFindings), m.styles.warning),
+		)
+	}
+	if m.activeTab == processesTab {
+		counts := countProcesses(m.processes)
+		mode := m.styles.success.Bold(true).Render(m.processMode.label())
+		if m.processMode == processRiskMode {
+			mode = m.styles.danger.Bold(true).Render(m.processMode.label())
+		} else if m.processMode == processLiveMode {
+			mode = m.styles.accent.Bold(true).Render(m.processMode.label())
+		}
+		if m.contentWidth() < 90 {
+			return lipgloss.JoinHorizontal(lipgloss.Top,
+				m.styles.muted.Render("VIEW "), mode, "  ",
+				m.trustBadge(), "  ",
+				m.metric("PROC", len(m.processes), m.styles.accent),
+				m.metric("SUS", counts.suspect, m.styles.warning),
+				m.metric("WARN", counts.warning, m.styles.danger),
+			)
+		}
+		line := lipgloss.JoinHorizontal(lipgloss.Top,
+			m.styles.muted.Render("VIEW "), mode, "  ",
+			m.trustBadge(), "  ",
+			m.metric("SHOWN", len(m.processRows), m.styles.accent),
+			m.metric("SUSPECT", counts.suspect, m.styles.warning),
+			m.metric("WARNING", counts.warning, m.styles.danger),
+		)
+		if m.contentWidth() >= 130 {
+			line += lipgloss.JoinHorizontal(lipgloss.Top,
+				m.metric("PROCESSES", len(m.processes), m.styles.accent),
+				m.metric("UNPACKAGED", counts.unpacked, m.styles.local),
+				m.metric("NEW", counts.fresh, m.styles.generated),
+			)
+		}
+		if m.processMode.flat() {
+			return line + m.styles.muted.Render("SORT ") + m.styles.accent.Bold(true).Render(m.processSort.label())
+		}
+		if counts.topName != "" && counts.topRisk >= riskReview {
+			return line + m.styles.muted.Render("TOP ") + m.styles.danger.Bold(true).Render(fmt.Sprintf("%s %d", truncatePlain(counts.topName, 18), counts.topRisk))
+		}
+		return line
+	}
+	if m.activeTab == loaderTab {
+		_, review, warning := findingLevelCounts(m.loaderVisible)
+		mode := m.styles.success.Bold(true).Render(m.loaderMode.label())
+		if m.loaderMode != loaderAllMode {
+			mode = m.styles.accent.Bold(true).Render(m.loaderMode.label())
+		}
+		if m.contentWidth() < 90 {
+			return lipgloss.JoinHorizontal(lipgloss.Top,
+				m.styles.muted.Render("VIEW "), mode, "  ",
+				m.trustBadge(), "  ",
+				m.metric("SHOWN", len(m.loaderVisible), m.styles.warning),
+				m.metric("WARN", warning, m.styles.danger),
+			)
+		}
+		return lipgloss.JoinHorizontal(lipgloss.Top,
+			m.styles.muted.Render("VIEW "), mode, "  ",
+			m.trustBadge(), "  ",
+			m.metric("SHOWN", len(m.loaderVisible), m.styles.accent),
+			m.metric("FINDINGS", len(m.loaderFindings), m.styles.warning),
+			m.metric("REVIEW", review, m.styles.warning),
+			m.metric("WARNING", warning, m.styles.danger),
+			m.metric("MAPPINGS", m.loaderCoverage.MappingsChecked, m.styles.generated),
+		)
+	}
 	if m.activeTab == dnsTab {
 		mode := m.styles.success.Bold(true).Render("HISTORY")
 		if m.dnsMode == historyDNSMode {
@@ -292,6 +395,21 @@ func (m Model) renderTab(value tab, title string, count int) string {
 	return m.styles.tab.Render(text)
 }
 
+// trustBadge renders the shared integrity filter for the process and loader
+// tabs so it is obvious when a view is hiding entries.
+func (m Model) trustBadge() string {
+	style := m.styles.muted
+	switch m.trust {
+	case trustSuspect:
+		style = m.styles.warning
+	case trustWarning:
+		style = m.styles.danger
+	case trustUnpackaged:
+		style = m.styles.local
+	}
+	return m.styles.muted.Render("TRUST ") + style.Bold(true).Render(m.trust.label())
+}
+
 func (m Model) metric(name string, value int, style lipgloss.Style) string {
 	return m.styles.muted.Render(name+" ") + style.Bold(true).Render(strconv.Itoa(value)) + "   "
 }
@@ -301,6 +419,49 @@ func (m Model) statusLine(width int) string {
 		return m.styles.danger.Render(truncatePlain(errorText, width))
 	}
 	parts := make([]string, 0, 4)
+	if m.activeTab == persistenceTab {
+		if m.scanning {
+			parts = append(parts, "scanning systemd and cron")
+		} else if m.packageManager != "" {
+			parts = append(parts, "package manifest: "+m.packageManager)
+		}
+		if len(m.scanWarnings) > 0 {
+			parts = append(parts, fmt.Sprintf("partial visibility: %d warnings", len(m.scanWarnings)))
+		}
+		parts = append(parts, "m switches inventory/integrity")
+		return m.styles.muted.Render(truncatePlain(strings.Join(parts, "  |  "), width))
+	}
+	if m.activeTab == processesTab || m.activeTab == loaderTab {
+		if m.runtimeScanning {
+			parts = append(parts, "verifying processes and loader state")
+		} else if !m.lastRuntimeScan.IsZero() {
+			parts = append(parts, "integrity "+m.lastRuntimeScan.Format("15:04:05"))
+		}
+		if m.activeTab == processesTab {
+			switch {
+			case m.runtimeSamplerErr != nil:
+				parts = append(parts, "live sampling unavailable: "+sanitizeTerminal(m.runtimeSamplerErr.Error(), false))
+			case !m.lastSample.IsZero():
+				parts = append(parts, "live "+m.lastSample.Format("15:04:05"))
+			}
+		}
+		if m.runtimePackageManager != "" {
+			parts = append(parts, "package manifest: "+m.runtimePackageManager)
+		}
+		if len(m.runtimeWarnings) > 0 {
+			parts = append(parts, fmt.Sprintf("partial visibility: %d warnings", len(m.runtimeWarnings)))
+		}
+		if m.activeTab == processesTab {
+			if m.processMode == processTreeMode {
+				parts = append(parts, "m cycles tree/live/risk, t filters trust, space collapses a branch")
+			} else {
+				parts = append(parts, "m cycles tree/live/risk, t filters trust, s sorts")
+			}
+		} else {
+			parts = append(parts, "m cycles all/injection/mappings, t filters trust")
+		}
+		return m.styles.muted.Render(truncatePlain(strings.Join(parts, "  |  "), width))
+	}
 	if m.activeTab == dnsTab {
 		if !m.lastDNS.IsZero() {
 			parts = append(parts, "last DNS event "+m.lastDNS.Format("15:04:05"))
@@ -335,13 +496,8 @@ func (m Model) statusLine(width int) string {
 	if !m.lastSnapshot.IsZero() {
 		parts = append(parts, "updated "+m.lastSnapshot.Format("15:04:05"))
 	}
-	if len(m.flowWarnings)+len(m.scanWarnings) > 0 {
-		parts = append(parts, fmt.Sprintf("partial visibility: %d warnings", len(m.flowWarnings)+len(m.scanWarnings)))
-	}
-	if m.scanning {
-		parts = append(parts, "scanning systemd and cron")
-	} else if m.packageManager != "" {
-		parts = append(parts, "package manifest: "+m.packageManager)
+	if len(m.flowWarnings) > 0 {
+		parts = append(parts, fmt.Sprintf("partial visibility: %d warnings", len(m.flowWarnings)))
 	}
 	if len(parts) == 0 {
 		parts = append(parts, "waiting for collectors")
@@ -350,6 +506,9 @@ func (m Model) statusLine(width int) string {
 }
 
 func (m Model) bodyView() string {
+	if m.legendOpen {
+		return m.legendView()
+	}
 	if m.detailOpen {
 		return m.detailView()
 	}
@@ -395,18 +554,41 @@ func (m Model) bodyView() string {
 		if m.scannerErr != nil && len(m.findings) == 0 {
 			return statusPanel(width, height, m.styles.danger.Render("Persistence scan unavailable")+"\n"+m.styles.muted.Render(sanitizeTerminal(m.scannerErr.Error(), false)))
 		}
+		if m.persistenceMode == persistenceIntegrityMode {
+			if len(m.integrityFindings) == 0 {
+				return statusPanel(width, height, m.styles.success.Render("All inventoried persistence files with digests match local package metadata"))
+			}
+			return m.integrityList.View()
+		}
 		return m.findingsList.View()
-	case integrityTab:
-		if m.scanning && len(m.integrityFindings) == 0 {
-			return statusPanel(width, height, m.styles.accent.Render("Checking persistence files against native package manifests..."))
+	case processesTab:
+		if m.runtimeScanning && len(m.processes) == 0 {
+			return statusPanel(width, height, m.styles.accent.Render("Building process hierarchy and verifying live executables..."))
 		}
-		if m.scannerErr != nil && len(m.integrityFindings) == 0 {
-			return statusPanel(width, height, m.styles.danger.Render("Integrity scan unavailable")+"\n"+m.styles.muted.Render(sanitizeTerminal(m.scannerErr.Error(), false)))
+		if m.runtimeScannerErr != nil && len(m.processes) == 0 {
+			return statusPanel(width, height, m.styles.danger.Render("Process inventory unavailable")+"\n"+m.styles.muted.Render(sanitizeTerminal(m.runtimeScannerErr.Error(), false)))
 		}
-		if len(m.integrityFindings) == 0 {
-			return statusPanel(width, height, m.styles.success.Render("All inventoried persistence files with digests match local package metadata"))
+		if len(m.processRows) == 0 {
+			if m.processMode == processRiskMode && m.trust == trustAll {
+				return statusPanel(width, height, m.styles.success.Render("No process carries a runtime integrity flag right now")+"\n"+m.styles.muted.Render("This is not proof that the host is clean. Press m for the full inventory."))
+			}
+			return statusPanel(width, height, m.styles.muted.Render("No visible process matches the current filters")+"\n"+m.styles.muted.Render("TRUST "+m.trust.label()+"  |  t cycles the trust filter"))
 		}
-		return m.integrityList.View()
+		return m.processTableView()
+	case loaderTab:
+		if m.runtimeScanning && len(m.loaderFindings) == 0 {
+			return statusPanel(width, height, m.styles.accent.Render("Inspecting loader controls and executable mappings..."))
+		}
+		if m.runtimeScannerErr != nil && len(m.loaderFindings) == 0 {
+			return statusPanel(width, height, m.styles.danger.Render("Loader integrity scan unavailable")+"\n"+m.styles.muted.Render(sanitizeTerminal(m.runtimeScannerErr.Error(), false)))
+		}
+		if len(m.loaderVisible) == 0 {
+			if len(m.loaderFindings) > 0 {
+				return statusPanel(width, height, m.styles.muted.Render("No loader finding matches the current filters")+"\n"+m.styles.muted.Render(m.loaderMode.label()+"  |  TRUST "+m.trust.label()+"  |  m and t change them"))
+			}
+			return statusPanel(width, height, m.styles.success.Render("No high-signal loader integrity findings in visible processes")+"\n"+m.styles.muted.Render("This is not proof that the host is clean."))
+		}
+		return m.loaderList.View()
 	default:
 		return ""
 	}
@@ -418,8 +600,77 @@ func (m Model) detailView() string {
 	return m.styles.panel.Width(max(1, m.contentWidth()-4)).Height(max(1, m.bodyHeight()-2)).Render(content)
 }
 
+func (m Model) legendView() string {
+	badge := func(provenance persistence.Provenance, text string) string {
+		label := m.styles.provenance(string(provenance)).Bold(true).Render("[" + provenanceLabel(provenance) + "]")
+		return label + "  " + m.styles.normal.Render(text)
+	}
+	provenance := []string{
+		m.styles.muted.Render("PROVENANCE"),
+		badge(persistence.ProvenancePackageMatch, "local package digest matches"),
+		badge(persistence.ProvenancePackageModified, "package-owned content differs"),
+		badge(persistence.ProvenancePackageOwned, "package owns path; no digest"),
+		badge(persistence.ProvenanceLocal, "package DB does not own path"),
+		badge(persistence.ProvenanceGenerated, "runtime-generated content"),
+		badge(persistence.ProvenanceUnverified, "unsupported or unreadable"),
+		m.styles.trust("PENDING").Bold(true).Render("[PENDING]") + m.styles.normal.Render("  live, not verified yet"),
+		m.styles.trust("KERNEL").Bold(true).Render("[KERNEL]") + m.styles.normal.Render("   no userspace executable"),
+		"",
+		m.styles.muted.Render("REVIEW LEVEL"),
+		m.styles.danger.Bold(true).Render("WARNING") + m.styles.normal.Render("  inspect promptly"),
+		m.styles.warning.Bold(true).Render("REVIEW") + m.styles.normal.Render("   validate in context"),
+		m.styles.success.Bold(true).Render("INFO") + m.styles.normal.Render("     inventory; not proven safe"),
+	}
+	triage := []string{
+		m.styles.muted.Render("PROCESS FLAGS"),
+		m.styles.normal.Render("ROOT effective UID 0 | CAPS capabilities"),
+		m.styles.normal.Render("KERNEL no userspace exe | NEW since last scan"),
+		m.styles.normal.Render("DELETED unlinked | REPLACED path/inode mismatch"),
+		m.styles.normal.Render("MEMFD memory-backed | VOLATILE temporary path"),
+		m.styles.normal.Render("WRITABLE unsafe mode | TRACED tracer attached"),
+		"",
+		m.styles.muted.Render("RISK SCORE (process tab)"),
+		m.riskBandLine(0, riskReview-1, "   ", "baseline, nothing raised"),
+		m.riskBandLine(riskReview, riskElevated-1, " ! ", "review one condition"),
+		m.riskBandLine(riskElevated, riskWarning-1, " ! ", "elevated, several signals"),
+		m.riskBandLine(riskWarning, riskCritical-1, "!! ", "warning, inspect promptly"),
+		m.riskBandLine(riskCritical, 99, "!! ", "critical, inspect first"),
+		m.styles.normal.Render("Ranks level, provenance, and flags. Not a verdict."),
+		"",
+		m.styles.muted.Render("TRUST FILTER (t): process and loader tabs"),
+		m.styles.normal.Render("ALL | SUSPECT flagged or raised"),
+		m.styles.normal.Render("WARNING high-signal | UNPACKAGED not package-matched"),
+	}
+	body := lipgloss.JoinVertical(lipgloss.Left, append(append(append([]string{}, provenance...), ""), triage...)...)
+	if m.contentWidth() >= 110 {
+		left := lipgloss.NewStyle().Width(52).Render(lipgloss.JoinVertical(lipgloss.Left, provenance...))
+		body = lipgloss.JoinHorizontal(lipgloss.Top, left, lipgloss.JoinVertical(lipgloss.Left, triage...))
+	}
+	// The caveats sit above the tables so a short terminal truncates the
+	// reference material rather than the warning that qualifies all of it.
+	lines := []string{
+		m.styles.accent.Bold(true).Render("LABEL AND FLAG LEGEND") + m.styles.muted.Render("  no label here is a malware verdict"),
+		m.styles.warning.Render("SYSTEM trusts this host's local package database."),
+		m.styles.warning.Render("A root compromise can alter both file and database."),
+		"",
+		body,
+	}
+	content := lipgloss.JoinVertical(lipgloss.Left, lines...)
+	return m.styles.panel.Width(max(1, m.contentWidth()-4)).Height(max(1, m.bodyHeight()-2)).MaxHeight(max(1, m.bodyHeight()-2)).Render(content)
+}
+
+// riskBandLine renders one step of the RISK colour ramp in the colour the
+// process rows use for that band.
+func (m Model) riskBandLine(low, high int, marker, text string) string {
+	style := m.styles.risk(low)
+	return style.Render(fmt.Sprintf("%s%2d-%2d", marker, low, high)) + m.styles.normal.Render("  "+text)
+}
+
 func (m Model) footerView() string {
 	width := m.contentWidth()
+	if m.legendOpen {
+		return m.help.ShortHelpView([]key.Binding{m.keys.Legend, m.keys.Back, m.keys.Quit})
+	}
 	if m.detailOpen {
 		return m.help.ShortHelpView([]key.Binding{m.keys.Back, table.DefaultKeyMap().LineUp, table.DefaultKeyMap().LineDown, m.keys.Quit})
 	}
@@ -429,7 +680,7 @@ func (m Model) footerView() string {
 		return m.help.ShortHelpView([]key.Binding{apply, cancel, m.keys.Quit})
 	}
 	m.help.Width = width
-	return m.help.View(m)
+	return truncateANSI(m.help.View(m), width)
 }
 
 func (m *Model) resizeComponents() {
@@ -459,8 +710,13 @@ func (m *Model) resizeComponents() {
 	setColumnsSafely(&m.dnsTable, dnsColumns)
 	m.dnsTable.SetWidth(width)
 	m.dnsTable.SetHeight(height)
+	setColumnsSafely(&m.processTable, columnsForProcesses(width, m.processMode))
+	m.processTable.SetWidth(width)
+	m.processTable.SetHeight(height)
+	m.clampProcessScroll()
 	m.findingsList.SetSize(width, height)
 	m.integrityList.SetSize(width, height)
+	m.loaderList.SetSize(width, height)
 	m.detail.Width = max(1, width-4)
 	m.detail.Height = max(1, height-5)
 	m.refreshDetailContent()
@@ -593,6 +849,27 @@ func (m Model) dnsCount() int {
 	return len(m.dnsEvents)
 }
 
+func (m Model) processCount() int {
+	if m.activeTab == processesTab {
+		return len(m.processRows)
+	}
+	return len(m.processes)
+}
+
+func (m Model) loaderCount() int {
+	if m.activeTab == loaderTab {
+		return len(m.loaderVisible)
+	}
+	return len(m.loaderFindings)
+}
+
+func (m Model) persistenceCount() int {
+	if m.activeTab == persistenceTab && m.persistenceMode == persistenceIntegrityMode {
+		return len(m.integrityFindings)
+	}
+	return len(m.findings)
+}
+
 func (m Model) contentWidth() int {
 	return max(20, m.width-2)
 }
@@ -703,6 +980,166 @@ func columnsForPorts(width int) []table.Column {
 		{Title: "NET", Width: 5},
 		{Title: "BIND", Width: 24},
 		{Title: "PROCESS", Width: process},
+	}
+}
+
+func columnsForProcesses(width int, mode processMode) []table.Column {
+	switch mode {
+	case processLiveMode:
+		return columnsForLiveProcesses(width)
+	case processRiskMode:
+		return columnsForRiskProcesses(width)
+	}
+	if width >= 150 {
+		executable := max(16, width-120)
+		return []table.Column{
+			{Title: "RISK", Width: 5},
+			{Title: "TRUST", Width: 9},
+			{Title: "PID", Width: 7},
+			{Title: "USER", Width: 11},
+			{Title: "CPU%", Width: 6},
+			{Title: "MEM%", Width: 6},
+			{Title: "PROCESS TREE", Width: 28},
+			{Title: "FLAGS", Width: 18},
+			{Title: "EXECUTABLE", Width: executable},
+			{Title: "SERVICE", Width: 16},
+		}
+	}
+	if width >= 135 {
+		executable := max(16, width-103)
+		return []table.Column{
+			{Title: "RISK", Width: 5},
+			{Title: "TRUST", Width: 9},
+			{Title: "PID", Width: 7},
+			{Title: "USER", Width: 11},
+			{Title: "CPU%", Width: 6},
+			{Title: "MEM%", Width: 6},
+			{Title: "PROCESS TREE", Width: 28},
+			{Title: "FLAGS", Width: 18},
+			{Title: "EXECUTABLE", Width: executable},
+		}
+	}
+	if width >= 95 {
+		tree := max(18, width-60)
+		return []table.Column{
+			{Title: "RISK", Width: 5},
+			{Title: "TRUST", Width: 9},
+			{Title: "PID", Width: 7},
+			{Title: "CPU%", Width: 6},
+			{Title: "MEM%", Width: 6},
+			{Title: "PROCESS TREE", Width: tree},
+			{Title: "FLAGS", Width: 16},
+		}
+	}
+	tree := max(16, width-31)
+	return []table.Column{
+		{Title: "RISK", Width: 5},
+		{Title: "PID", Width: 6},
+		{Title: "PROCESS TREE", Width: tree},
+		{Title: "FLAGS", Width: 12},
+	}
+}
+
+func columnsForLiveProcesses(width int) []table.Column {
+	if width >= 150 {
+		command := max(16, width-98)
+		return []table.Column{
+			{Title: "RISK", Width: 5},
+			{Title: "PID", Width: 7},
+			{Title: "USER", Width: 11},
+			{Title: "CPU%", Width: 6},
+			{Title: "MEM%", Width: 6},
+			{Title: "RSS", Width: 8},
+			{Title: "TIME", Width: 8},
+			{Title: "ST", Width: 3},
+			{Title: "TRUST", Width: 9},
+			{Title: "FLAGS", Width: 18},
+			{Title: "COMMAND", Width: command},
+		}
+	}
+	if width >= 135 {
+		command := max(16, width-83)
+		return []table.Column{
+			{Title: "RISK", Width: 5},
+			{Title: "PID", Width: 7},
+			{Title: "USER", Width: 11},
+			{Title: "CPU%", Width: 6},
+			{Title: "MEM%", Width: 6},
+			{Title: "RSS", Width: 8},
+			{Title: "TRUST", Width: 9},
+			{Title: "FLAGS", Width: 18},
+			{Title: "COMMAND", Width: command},
+		}
+	}
+	if width >= 95 {
+		process := max(14, width-71)
+		return []table.Column{
+			{Title: "RISK", Width: 5},
+			{Title: "PID", Width: 7},
+			{Title: "USER", Width: 10},
+			{Title: "CPU%", Width: 6},
+			{Title: "MEM%", Width: 6},
+			{Title: "TRUST", Width: 9},
+			{Title: "PROCESS", Width: process},
+			{Title: "FLAGS", Width: 16},
+		}
+	}
+	process := max(12, width-45)
+	return []table.Column{
+		{Title: "RISK", Width: 5},
+		{Title: "PID", Width: 6},
+		{Title: "CPU%", Width: 6},
+		{Title: "MEM%", Width: 6},
+		{Title: "PROCESS", Width: process},
+		{Title: "FLAGS", Width: 12},
+	}
+}
+
+func columnsForRiskProcesses(width int) []table.Column {
+	if width >= 150 {
+		reason := max(18, width-93)
+		return []table.Column{
+			{Title: "RISK", Width: 5},
+			{Title: "PID", Width: 7},
+			{Title: "USER", Width: 11},
+			{Title: "CPU%", Width: 6},
+			{Title: "MEM%", Width: 6},
+			{Title: "TRUST", Width: 9},
+			{Title: "PROCESS", Width: 18},
+			{Title: "FLAGS", Width: 18},
+			{Title: "REASON", Width: reason},
+		}
+	}
+	if width >= 135 {
+		reason := max(18, width-79)
+		return []table.Column{
+			{Title: "RISK", Width: 5},
+			{Title: "PID", Width: 7},
+			{Title: "USER", Width: 11},
+			{Title: "TRUST", Width: 9},
+			{Title: "PROCESS", Width: 18},
+			{Title: "FLAGS", Width: 18},
+			{Title: "REASON", Width: reason},
+		}
+	}
+	if width >= 95 {
+		reason := max(14, width-63)
+		return []table.Column{
+			{Title: "RISK", Width: 5},
+			{Title: "PID", Width: 7},
+			{Title: "TRUST", Width: 9},
+			{Title: "PROCESS", Width: 16},
+			{Title: "FLAGS", Width: 16},
+			{Title: "REASON", Width: reason},
+		}
+	}
+	process := max(12, width-40)
+	return []table.Column{
+		{Title: "RISK", Width: 5},
+		{Title: "PID", Width: 6},
+		{Title: "TRUST", Width: 8},
+		{Title: "PROCESS", Width: process},
+		{Title: "FLAGS", Width: 12},
 	}
 }
 
@@ -843,6 +1280,234 @@ func rowsForDNSEvents(entries []dnsHistoryEntry, columns []table.Column) []table
 		rows = append(rows, row)
 	}
 	return rows
+}
+
+func (m Model) rowsForProcesses(entries []processTreeRow, columns []table.Column) []table.Row {
+	rows := make([]table.Row, 0, len(entries))
+	for _, entry := range entries {
+		process := entry.process
+		metric := m.metrics[process.ID]
+		marker := "  "
+		if entry.hasChildren {
+			marker = "- "
+			if entry.collapsed {
+				marker = "+ "
+			}
+		}
+		tree := strings.Repeat("| ", entry.depth) + marker + process.Name
+		trust := m.processTrustLabel(process)
+		state := process.State
+		if metric.sampled && metric.state != "" {
+			state = metric.state
+		}
+		row := make(table.Row, 0, len(columns))
+		for _, column := range columns {
+			switch column.Title {
+			case "RISK":
+				row = append(row, riskCell(process))
+			case "TRUST":
+				row = append(row, trust)
+			case "PID":
+				row = append(row, strconv.Itoa(process.PID))
+			case "USER":
+				row = append(row, sanitizeTerminal(process.User, false))
+			case "CPU%":
+				row = append(row, formatPercent(metric.cpuPercent, metric.hasCPU))
+			case "MEM%":
+				row = append(row, formatPercent(metric.memPercent, metric.sampled && m.memoryTotal > 0))
+			case "RSS":
+				row = append(row, formatBytes(metric.rssBytes))
+			case "TIME":
+				row = append(row, formatCPUTime(metric.cpuSeconds))
+			case "ST":
+				row = append(row, state)
+			case "PROCESS TREE":
+				row = append(row, sanitizeTerminal(tree, false))
+			case "PROCESS":
+				row = append(row, sanitizeTerminal(process.Name, false))
+			case "FLAGS":
+				row = append(row, flagsText(process))
+			case "EXECUTABLE":
+				row = append(row, sanitizeTerminal(process.Executable, false))
+			case "SERVICE":
+				row = append(row, sanitizeTerminal(process.Service, false))
+			case "COMMAND":
+				command := process.Command
+				if command == "" {
+					command = process.Executable
+				}
+				if command == "" {
+					command = "[" + process.Name + "]"
+				}
+				row = append(row, sanitizeTerminal(command, false))
+			case "REASON":
+				row = append(row, sanitizeTerminal(process.Reason, false))
+			}
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+// processTableView renders the process table instead of delegating to the
+// bubbles table. The bubbles table paints every cell in one style and
+// truncates with a helper that miscounts escape sequences, so per-cell colour
+// has to be applied here. m.processTable still owns the cursor and the key
+// bindings; only the drawing is local.
+func (m Model) processTableView() string {
+	columns := m.processTable.Columns()
+	height := m.bodyHeight()
+	rowCount := max(1, height-2)
+	lines := make([]string, 0, height)
+	lines = append(lines, strings.Split(m.processHeaderLine(columns), "\n")...)
+	for offset := 0; offset < rowCount; offset++ {
+		index := m.processScroll + offset
+		if index >= len(m.processRows) {
+			lines = append(lines, "")
+			continue
+		}
+		lines = append(lines, m.processRowLine(columns, m.processRows[index], index == m.processTable.Cursor()))
+	}
+	return strings.Join(lines[:min(len(lines), height)], "\n")
+}
+
+func (m Model) processHeaderLine(columns []table.Column) string {
+	cells := make([]string, 0, len(columns))
+	for _, column := range columns {
+		cells = append(cells, m.styles.tableHeader.Render(fitCell(column.Title, column.Width)+" "))
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, cells...)
+}
+
+func (m Model) processRowLine(columns []table.Column, entry processTreeRow, selected bool) string {
+	values := m.rowsForProcesses([]processTreeRow{entry}, columns)
+	if len(values) == 0 {
+		return ""
+	}
+	cells := make([]string, 0, len(columns))
+	for index, column := range columns {
+		if index >= len(values[0]) {
+			break
+		}
+		style := m.processCellStyle(column.Title, entry.process)
+		if selected {
+			style = style.Bold(true).Background(m.styles.selectedFill)
+		}
+		cells = append(cells, style.Render(fitCell(values[0][index], column.Width)+" "))
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, cells...)
+}
+
+// processCellStyle picks the colour for one cell from the evidence in its row.
+func (m Model) processCellStyle(title string, process runtimecheck.Process) lipgloss.Style {
+	metric := m.metrics[process.ID]
+	switch title {
+	case "RISK":
+		return m.styles.risk(processRisk(process))
+	case "TRUST":
+		return m.styles.trust(m.processTrustLabel(process))
+	case "USER":
+		return m.styles.user(process.User)
+	case "FLAGS":
+		return m.flagsStyle(process)
+	case "CPU%":
+		return m.rateStyle(metric.cpuPercent, metric.hasCPU, 50, 10)
+	case "MEM%":
+		return m.rateStyle(metric.memPercent, metric.sampled && m.memoryTotal > 0, 20, 5)
+	case "ST":
+		return m.stateStyle(process, metric)
+	case "PID", "RSS", "TIME", "SERVICE", "REASON":
+		return m.styles.muted
+	default:
+		return m.styles.tableCell
+	}
+}
+
+func (m Model) flagsStyle(process runtimecheck.Process) lipgloss.Style {
+	raised := riskFlags(process)
+	if len(raised) == 0 {
+		if len(process.Flags) == 0 {
+			return m.styles.faint
+		}
+		return m.styles.muted
+	}
+	for _, flag := range raised {
+		switch flag {
+		case runtimecheck.FlagMemfd, runtimecheck.FlagVolatile, runtimecheck.FlagDeleted,
+			runtimecheck.FlagReplaced, runtimecheck.FlagWritable:
+			return m.styles.danger
+		}
+	}
+	return m.styles.warning
+}
+
+func (m Model) rateStyle(value float64, known bool, high, elevated float64) lipgloss.Style {
+	switch {
+	case !known:
+		return m.styles.faint
+	case value >= high:
+		return m.styles.danger
+	case value >= elevated:
+		return m.styles.warning
+	case value == 0:
+		return m.styles.faint
+	default:
+		return m.styles.tableCell
+	}
+}
+
+func (m Model) stateStyle(process runtimecheck.Process, metric processMetric) lipgloss.Style {
+	state := process.State
+	if metric.sampled && metric.state != "" {
+		state = metric.state
+	}
+	switch state {
+	case "R":
+		return m.styles.success
+	case "Z":
+		return m.styles.danger
+	case "D":
+		return m.styles.warning
+	default:
+		return m.styles.muted
+	}
+}
+
+// fitCell truncates and pads a plain value to exactly one column width. It
+// runs before styling so no escape sequence is ever measured or cut.
+func fitCell(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	return lipgloss.NewStyle().Width(width).MaxWidth(width).Inline(true).Render(truncatePlain(value, width))
+}
+
+// processTrustLabel names the integrity verdict for a process row. A process
+// the sampler found but the last integrity scan has not covered is PENDING
+// rather than UNKNOWN: nothing failed, the evidence is not collected yet.
+func (m Model) processTrustLabel(process runtimecheck.Process) string {
+	if process.KernelThread {
+		return "KERNEL"
+	}
+	if process.Provenance == persistence.ProvenanceUnverified &&
+		(hasFlag(process, runtimecheck.FlagNew) || m.lastRuntimeScan.IsZero()) {
+		return "PENDING"
+	}
+	return provenanceLabel(process.Provenance)
+}
+
+// riskCell marks the two levels the scanner raises so a suspicious row is
+// visible without colour: bubbles tables render every cell in one style.
+func riskCell(process runtimecheck.Process) string {
+	score := processRisk(process)
+	switch {
+	case score >= riskWarning:
+		return "!! " + strconv.Itoa(score)
+	case score >= riskReview:
+		return " ! " + strconv.Itoa(score)
+	default:
+		return "   " + strconv.Itoa(score)
+	}
 }
 
 func (m Model) renderFlowDetail(item flow.Flow) string {
@@ -1063,6 +1728,79 @@ func (m Model) renderFindingDetail(finding persistence.Finding) string {
 	return lipgloss.JoinVertical(lipgloss.Left, lines...)
 }
 
+func (m Model) renderProcessDetail(process runtimecheck.Process) string {
+	parent := "-"
+	for _, candidate := range m.processes {
+		if candidate.PID == process.PPID {
+			parent = fmt.Sprintf("%s (%d)", candidate.Name, candidate.PID)
+			break
+		}
+	}
+	ancestry := make([]string, 0)
+	byPID := make(map[int]runtimecheck.Process, len(m.processes))
+	for _, candidate := range m.processes {
+		byPID[candidate.PID] = candidate
+	}
+	current := process
+	seen := make(map[int]bool)
+	for current.PID > 0 && !seen[current.PID] {
+		seen[current.PID] = true
+		ancestry = append(ancestry, fmt.Sprintf("%s(%d)", current.Name, current.PID))
+		next, found := byPID[current.PPID]
+		if !found {
+			break
+		}
+		current = next
+	}
+	for left, right := 0, len(ancestry)-1; left < right; left, right = left+1, right-1 {
+		ancestry[left], ancestry[right] = ancestry[right], ancestry[left]
+	}
+	metric := m.metrics[process.ID]
+	lines := []string{
+		m.detailField("Name", process.Name),
+		m.detailField("PID", strconv.Itoa(process.PID)),
+		m.detailField("Parent", parent),
+		m.detailField("Hierarchy", strings.Join(ancestry, " -> ")),
+		m.detailField("State", process.State),
+		m.detailField("Risk score", fmt.Sprintf("%d of 99 (%s)", processRisk(process), riskBand(processRisk(process)))),
+		m.detailField("Review level", string(process.Level)),
+		m.detailField("Provenance", string(process.Provenance)),
+		m.detailField("Flags", strings.Join(process.Flags, ", ")),
+		m.detailField("User", process.User),
+		m.detailField("UID / effective", fmt.Sprintf("%d / %d", process.UID, process.EffectiveUID)),
+		m.detailField("Executable", process.Executable),
+		m.detailField("Raw executable", process.ExecutableTarget),
+		m.detailField("Command", process.Command),
+		m.detailField("Service", process.Service),
+		m.detailField("Root context", process.RootContext),
+		m.detailField("Start ticks", strconv.FormatUint(process.StartTime, 10)),
+		m.detailField("Package", process.Package),
+		m.detailField("Package manager", process.PackageManager),
+		m.detailField("Integrity", process.Integrity),
+		m.detailField("Executable mode", process.ExecutableMode),
+		m.detailField("Executable UID/GID", fmt.Sprintf("%d / %d", process.ExecutableUID, process.ExecutableGID)),
+		m.detailField("Capabilities", process.EffectiveCapabilities),
+		m.detailField("Tracer PID", strconv.Itoa(process.TracerPID)),
+		m.detailField("No new privileges", strconv.FormatBool(process.NoNewPrivs)),
+		m.detailField("Seccomp mode", strconv.Itoa(process.Seccomp)),
+		m.detailField("Reason", process.Reason),
+	}
+	if metric.sampled {
+		lines = append(lines,
+			"",
+			m.styles.accent.Bold(true).Render("LIVE SAMPLE"),
+			m.detailField("Sampled at", m.lastSample.Format(time.RFC3339)),
+			m.detailField("CPU", formatPercent(metric.cpuPercent, metric.hasCPU)+"%"),
+			m.detailField("CPU time", formatCPUTime(metric.cpuSeconds)),
+			m.detailField("Memory", formatBytes(metric.rssBytes)+" resident ("+formatPercent(metric.memPercent, m.memoryTotal > 0)+"%)"),
+			m.detailField("Threads", strconv.Itoa(metric.threads)),
+			m.detailField("Scheduler state", metric.state),
+		)
+	}
+	lines = append(lines, "", m.styles.warning.Render("Package match compares the live executable inode with local package metadata; it does not prove the package database or kernel is trustworthy."))
+	return lipgloss.JoinVertical(lipgloss.Left, lines...)
+}
+
 func (m Model) detailField(label, value string) string {
 	label = sanitizeTerminal(label, false)
 	value = sanitizeTerminal(value, true)
@@ -1088,6 +1826,37 @@ type dnsStats struct {
 	cached    int
 	queries   int
 	responses int
+}
+
+func processLevelCounts(processes []runtimecheck.Process) (int, int, int) {
+	system, review, warning := 0, 0, 0
+	for _, process := range processes {
+		if process.Provenance == persistence.ProvenancePackageMatch {
+			system++
+		}
+		switch process.Level {
+		case persistence.LevelWarning:
+			warning++
+		case persistence.LevelReview:
+			review++
+		}
+	}
+	return system, review, warning
+}
+
+func findingLevelCounts(findings []persistence.Finding) (int, int, int) {
+	info, review, warning := 0, 0, 0
+	for _, finding := range findings {
+		switch finding.Level {
+		case persistence.LevelWarning:
+			warning++
+		case persistence.LevelReview:
+			review++
+		default:
+			info++
+		}
+	}
+	return info, review, warning
 }
 
 func statsForDNS(entries []dnsmon.Entry) dnsStats {

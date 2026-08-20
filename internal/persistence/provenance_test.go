@@ -116,6 +116,25 @@ func TestIncompleteManifestDoesNotClaimPathIsLocal(t *testing.T) {
 	}
 }
 
+func TestManifestVerifierChecksAlreadyOpenContent(t *testing.T) {
+	content := []byte("live executable bytes")
+	sum := md5.Sum(content)
+	verifier := &manifestVerifier{
+		name: "test",
+		records: map[string]packageRecord{
+			"/usr/bin/example": {packageName: "example", algorithm: "md5", digest: sum[:]},
+		},
+	}
+	matching := verifier.VerifyContent("/usr/bin/example", bytes.NewReader(content))
+	if matching.provenance != ProvenancePackageMatch {
+		t.Fatalf("matching live content = %#v", matching)
+	}
+	modified := verifier.VerifyContent("/usr/bin/example", bytes.NewReader([]byte("replaced")))
+	if modified.provenance != ProvenancePackageModified {
+		t.Fatalf("modified live content = %#v", modified)
+	}
+}
+
 func TestManifestAliasRequiresUsrMerge(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "usr/lib/systemd/system"), 0o755); err != nil {

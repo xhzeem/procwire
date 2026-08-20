@@ -22,6 +22,7 @@ import (
 	"github.com/xhzeem/procwire/internal/flow"
 	"github.com/xhzeem/procwire/internal/observe"
 	"github.com/xhzeem/procwire/internal/persistence"
+	"github.com/xhzeem/procwire/internal/runtimecheck"
 )
 
 type Recorder interface {
@@ -29,22 +30,26 @@ type Recorder interface {
 }
 
 type Config struct {
-	Collector  observe.Collector
-	DNSMonitor dnsmon.PacketMonitor
-	DNSError   error
-	HostsPath  string
-	Scanner    persistence.Scanner
-	Recorder   Recorder
-	ReportPath string
-	Interval   time.Duration
-	RunFor     time.Duration
-	Version    string
+	Collector      observe.Collector
+	DNSMonitor     dnsmon.PacketMonitor
+	DNSError       error
+	HostsPath      string
+	Scanner        persistence.Scanner
+	RuntimeScanner runtimecheck.Scanner
+	RuntimeSampler runtimecheck.Sampler
+	Recorder       Recorder
+	ReportPath     string
+	Interval       time.Duration
+	RunFor         time.Duration
+	RuntimeRescan  time.Duration
+	Version        string
 }
 
 type tab int
 
 type networkMode int
 type dnsMode int
+type persistenceMode int
 
 const (
 	inboundTab tab = iota
@@ -52,7 +57,8 @@ const (
 	dnsTab
 	portsTab
 	persistenceTab
-	integrityTab
+	processesTab
+	loaderTab
 	tabCount
 )
 
@@ -66,6 +72,16 @@ const (
 	historyDNSMode
 )
 
+const (
+	persistenceInventoryMode persistenceMode = iota
+	persistenceIntegrityMode
+)
+
+// defaultRuntimeRescan is how often the expensive process and loader integrity
+// scan repeats on its own. Live sampling keeps the process tab current between
+// those scans at the polling interval.
+const defaultRuntimeRescan = 30 * time.Second
+
 const dnsHistoryLimit = 20_000
 const dnsBatchWindow = 16 * time.Millisecond
 
@@ -78,6 +94,13 @@ type dnsHistory struct {
 	entries []dnsHistoryEntry
 	start   int
 	nextID  uint64
+}
+
+type processTreeRow struct {
+	process     runtimecheck.Process
+	depth       int
+	hasChildren bool
+	collapsed   bool
 }
 
 func (history *dnsHistory) append(event dnsmon.Event) dnsHistoryEntry {
@@ -101,71 +124,106 @@ func (history dnsHistory) at(index int) dnsHistoryEntry {
 }
 
 type Model struct {
-	collector  observe.Collector
-	dnsMonitor dnsmon.PacketMonitor
-	scanner    persistence.Scanner
-	recorder   Recorder
-	store      *flow.Store
-	dnsStore   *dnsmon.Store
-	interval   time.Duration
-	report     string
-	version    string
-	runFor     time.Duration
+	collector      observe.Collector
+	dnsMonitor     dnsmon.PacketMonitor
+	scanner        persistence.Scanner
+	runtimeScanner runtimecheck.Scanner
+	runtimeSampler runtimecheck.Sampler
+	recorder       Recorder
+	store          *flow.Store
+	dnsStore       *dnsmon.Store
+	interval       time.Duration
+	runtimeRescan  time.Duration
+	report         string
+	version        string
+	runFor         time.Duration
 
-	activeTab     tab
-	networkView   tab
-	networkMode   networkMode
-	dnsMode       dnsMode
-	networkTable  table.Model
-	dnsTable      table.Model
-	portsTable    table.Model
-	findingsList  list.Model
-	integrityList list.Model
-	detail        viewport.Model
-	help          help.Model
-	filter        textinput.Model
-	keys          keyMap
-	styles        styles
+	activeTab       tab
+	networkView     tab
+	networkMode     networkMode
+	dnsMode         dnsMode
+	persistenceMode persistenceMode
+	processMode     processMode
+	loaderMode      loaderMode
+	processSort     processSort
+	trust           trustFilter
+	networkTable    table.Model
+	dnsTable        table.Model
+	portsTable      table.Model
+	processTable    table.Model
+	findingsList    list.Model
+	integrityList   list.Model
+	loaderList      list.Model
+	detail          viewport.Model
+	help            help.Model
+	filter          textinput.Model
+	keys            keyMap
+	styles          styles
 
-	width             int
-	height            int
-	baseFlows         []flow.Flow
-	networkFlows      []flow.Flow
-	baseTraffic       []flow.Traffic
-	networkTraffic    []flow.Traffic
-	baseDNS           []dnsmon.Entry
-	dnsEntries        []dnsmon.Entry
-	dnsHistory        dnsHistory
-	dnsEvents         []dnsHistoryEntry
-	dnsNames          map[netip.Addr][]string
-	portFlows         []flow.Flow
-	findings          []persistence.Finding
-	integrityFindings []persistence.Finding
-	packageManager    string
-	lastSnapshot      time.Time
-	lastDNS           time.Time
-	flowWarnings      []string
-	scanWarnings      []string
-	dnsWarning        string
-	dnsWarningCount   uint64
-	collectorErr      error
-	dnsErr            error
-	scannerErr        error
-	recorderErr       error
-	scanning          bool
-	paused            bool
-	filtering         bool
-	filterBefore      string
-	detailOpen        bool
-	detailTitle       string
-	detailFlowID      string
-	detailTrafficID   string
-	detailDNSID       string
-	detailDNSEventID  uint64
-	detailFindingID   string
-	dnsFollow         bool
-	refreshQueued     bool
-	collectorStatus   string
+	width                 int
+	height                int
+	baseFlows             []flow.Flow
+	networkFlows          []flow.Flow
+	baseTraffic           []flow.Traffic
+	networkTraffic        []flow.Traffic
+	baseDNS               []dnsmon.Entry
+	dnsEntries            []dnsmon.Entry
+	dnsHistory            dnsHistory
+	dnsEvents             []dnsHistoryEntry
+	dnsNames              map[netip.Addr][]string
+	portFlows             []flow.Flow
+	findings              []persistence.Finding
+	integrityFindings     []persistence.Finding
+	scanProcesses         []runtimecheck.Process
+	sampleProcesses       []runtimecheck.ProcessSample
+	processes             []runtimecheck.Process
+	processRows           []processTreeRow
+	processScroll         int
+	metrics               map[string]processMetric
+	processCPU            map[string]uint64
+	memoryTotal           uint64
+	loaderFindings        []persistence.Finding
+	loaderVisible         []persistence.Finding
+	collapsedProcesses    map[string]bool
+	packageManager        string
+	runtimePackageManager string
+	lastSnapshot          time.Time
+	lastDNS               time.Time
+	lastRuntimeScan       time.Time
+	lastSample            time.Time
+	flowWarnings          []string
+	scanWarnings          []string
+	runtimeWarnings       []string
+	processCoverage       runtimecheck.ProcessCoverage
+	loaderCoverage        runtimecheck.LoaderCoverage
+	dnsWarning            string
+	dnsWarningCount       uint64
+	collectorErr          error
+	dnsErr                error
+	scannerErr            error
+	runtimeScannerErr     error
+	runtimeSamplerErr     error
+	recorderErr           error
+	scanning              bool
+	runtimeScanning       bool
+	runtimeSampling       bool
+	paused                bool
+	filtering             bool
+	filterBefore          string
+	detailOpen            bool
+	detailTitle           string
+	detailFlowID          string
+	detailTrafficID       string
+	detailDNSID           string
+	detailDNSEventID      uint64
+	detailFindingID       string
+	detailProcessID       string
+	detailLoaderID        string
+	dnsFollow             bool
+	refreshQueued         bool
+	collectorStatus       string
+	sampleStatus          string
+	legendOpen            bool
 }
 
 type snapshotMsg struct {
@@ -175,6 +233,16 @@ type snapshotMsg struct {
 
 type scanMsg struct {
 	result persistence.Result
+	err    error
+}
+
+type runtimeScanMsg struct {
+	result runtimecheck.Result
+	err    error
+}
+
+type runtimeSampleMsg struct {
+	sample runtimecheck.Sample
 	err    error
 }
 
@@ -190,6 +258,9 @@ type dnsMonitorMsg struct {
 func New(config Config) Model {
 	if config.Interval <= 0 {
 		config.Interval = time.Second
+	}
+	if config.RuntimeRescan == 0 {
+		config.RuntimeRescan = defaultRuntimeRescan
 	}
 	styleSet := newStyles()
 	tableStyles := table.DefaultStyles()
@@ -212,9 +283,15 @@ func New(config Config) Model {
 		table.WithHeight(10),
 		table.WithStyles(tableStyles),
 	)
+	processes := table.New(
+		table.WithFocused(true),
+		table.WithHeight(10),
+		table.WithStyles(tableStyles),
+	)
 
 	findingList := newFindingList(styleSet)
 	integrityList := newFindingList(styleSet)
+	loaderList := newFindingList(styleSet)
 
 	filter := textinput.New()
 	filter.Prompt = "Filter: "
@@ -248,37 +325,51 @@ func New(config Config) Model {
 	baseDNS := dnsStore.Entries(now)
 
 	return Model{
-		collector:     config.Collector,
-		dnsMonitor:    config.DNSMonitor,
-		scanner:       config.Scanner,
-		recorder:      config.Recorder,
-		store:         flow.NewStore(),
-		dnsStore:      dnsStore,
-		interval:      config.Interval,
-		report:        config.ReportPath,
-		version:       config.Version,
-		runFor:        config.RunFor,
-		networkTable:  network,
-		dnsTable:      dnsTable,
-		portsTable:    ports,
-		findingsList:  findingList,
-		integrityList: integrityList,
-		detail:        viewport.New(80, 10),
-		help:          helpModel,
-		filter:        filter,
-		keys:          defaultKeyMap(),
-		styles:        styleSet,
-		activeTab:     outboundTab,
-		networkView:   outboundTab,
-		networkMode:   sessionMode,
-		dnsMode:       historyDNSMode,
-		dnsFollow:     true,
-		baseDNS:       baseDNS,
-		dnsNames:      indexDNSNames(baseDNS, now),
-		dnsErr:        config.DNSError,
-		dnsWarning:    dnsWarning,
-		scanning:      true,
-		refreshQueued: true,
+		collector:          config.Collector,
+		dnsMonitor:         config.DNSMonitor,
+		scanner:            config.Scanner,
+		runtimeScanner:     config.RuntimeScanner,
+		runtimeSampler:     config.RuntimeSampler,
+		recorder:           config.Recorder,
+		store:              flow.NewStore(),
+		dnsStore:           dnsStore,
+		interval:           config.Interval,
+		runtimeRescan:      config.RuntimeRescan,
+		report:             config.ReportPath,
+		version:            config.Version,
+		runFor:             config.RunFor,
+		networkTable:       network,
+		dnsTable:           dnsTable,
+		portsTable:         ports,
+		processTable:       processes,
+		findingsList:       findingList,
+		integrityList:      integrityList,
+		loaderList:         loaderList,
+		detail:             viewport.New(80, 10),
+		help:               helpModel,
+		filter:             filter,
+		keys:               defaultKeyMap(),
+		styles:             styleSet,
+		activeTab:          outboundTab,
+		networkView:        outboundTab,
+		networkMode:        sessionMode,
+		dnsMode:            historyDNSMode,
+		persistenceMode:    persistenceInventoryMode,
+		processMode:        processTreeMode,
+		loaderMode:         loaderAllMode,
+		processSort:        sortByRisk,
+		trust:              trustAll,
+		dnsFollow:          true,
+		baseDNS:            baseDNS,
+		dnsNames:           indexDNSNames(baseDNS, now),
+		dnsErr:             config.DNSError,
+		dnsWarning:         dnsWarning,
+		scanning:           true,
+		runtimeScanning:    true,
+		refreshQueued:      true,
+		collapsedProcesses: make(map[string]bool),
+		metrics:            make(map[string]processMetric),
+		processCPU:         make(map[string]uint64),
 	}
 }
 
@@ -305,7 +396,7 @@ func newFindingList(styleSet styles) list.Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	commands := []tea.Cmd{m.collectCmd(), m.scanCmd()}
+	commands := []tea.Cmd{m.collectCmd(), m.scanCmd(), m.runtimeScanCmd(), m.runtimeSampleCmd()}
 	if m.dnsMonitor != nil && m.dnsErr == nil {
 		commands = append(commands, m.waitDNSCmd())
 	}
@@ -399,6 +490,15 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshQueued = true
 			commands = append(commands, m.collectCmd())
 		}
+		if !m.runtimeSampling && m.runtimeSampler != nil && m.runtimeSamplerErr == nil {
+			m.runtimeSampling = true
+			commands = append(commands, m.runtimeSampleCmd())
+		}
+		if !m.runtimeScanning && m.runtimeRescan > 0 && !m.lastRuntimeScan.IsZero() &&
+			time.Since(m.lastRuntimeScan) >= m.runtimeRescan {
+			m.runtimeScanning = true
+			commands = append(commands, m.runtimeScanCmd())
+		}
 
 	case scanMsg:
 		m.scanning = false
@@ -424,9 +524,53 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshDetailContent()
 		}
 
+	case runtimeScanMsg:
+		m.runtimeScanning = false
+		m.runtimeScannerErr = msg.err
+		if msg.err == nil {
+			m.scanProcesses = msg.result.Processes
+			m.loaderFindings = msg.result.LoaderFindings
+			m.runtimePackageManager = msg.result.PackageManager
+			m.runtimeWarnings = msg.result.Warnings
+			m.processCoverage = msg.result.ProcessCoverage
+			m.loaderCoverage = msg.result.LoaderCoverage
+			m.lastRuntimeScan = msg.result.ScannedAt
+			m.rebuildProcesses()
+			commands = append(commands, m.syncLoaderList())
+			m.syncTables()
+			m.record("runtime_scan_summary", map[string]any{
+				"scanned_at":       msg.result.ScannedAt,
+				"package_manager":  msg.result.PackageManager,
+				"process_coverage": msg.result.ProcessCoverage,
+				"loader_coverage":  msg.result.LoaderCoverage,
+				"warnings":         msg.result.Warnings,
+			})
+			for _, process := range msg.result.Processes {
+				m.record("process_observation", process)
+			}
+			for _, finding := range msg.result.LoaderFindings {
+				m.record("loader_finding", finding)
+			}
+			m.refreshDetailContent()
+		}
+
+	case runtimeSampleMsg:
+		m.runtimeSampling = false
+		m.runtimeSamplerErr = msg.err
+		m.recordSampleStatus(msg)
+		if msg.err == nil {
+			m.applySample(msg.sample)
+			if !m.paused {
+				m.syncTables()
+			}
+			m.refreshDetailContent()
+		}
+
 	case list.FilterMatchesMsg:
 		var command tea.Cmd
-		if m.activeTab == integrityTab {
+		if m.activeTab == loaderTab {
+			m.loaderList, command = m.loaderList.Update(msg)
+		} else if m.activeTab == persistenceTab && m.persistenceMode == persistenceIntegrityMode {
 			m.integrityList, command = m.integrityList.Update(msg)
 		} else {
 			m.findingsList, command = m.findingsList.Update(msg)
@@ -435,6 +579,19 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	if msg, ok := message.(tea.KeyMsg); ok {
+		if m.legendOpen {
+			switch {
+			case key.Matches(msg, m.keys.Legend), key.Matches(msg, m.keys.Back):
+				m.legendOpen = false
+				m.resizeComponents()
+				return m, tea.Batch(commands...)
+			case key.Matches(msg, m.keys.Quit):
+				return m, tea.Quit
+			default:
+				return m, tea.Batch(commands...)
+			}
+		}
+
 		if m.detailOpen {
 			switch {
 			case key.Matches(msg, m.keys.Back), key.Matches(msg, m.keys.Detail):
@@ -444,6 +601,8 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				m.detailDNSID = ""
 				m.detailDNSEventID = 0
 				m.detailFindingID = ""
+				m.detailProcessID = ""
+				m.detailLoaderID = ""
 				m.resizeComponents()
 				return m, tea.Batch(commands...)
 			case key.Matches(msg, m.keys.Quit):
@@ -480,13 +639,16 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(commands...)
 		}
 
-		if (m.activeTab == persistenceTab && m.findingsList.SettingFilter()) ||
-			(m.activeTab == integrityTab && m.integrityList.SettingFilter()) {
+		if (m.activeTab == persistenceTab && m.persistenceMode == persistenceInventoryMode && m.findingsList.SettingFilter()) ||
+			(m.activeTab == persistenceTab && m.persistenceMode == persistenceIntegrityMode && m.integrityList.SettingFilter()) ||
+			(m.activeTab == loaderTab && m.loaderList.SettingFilter()) {
 			if msg.String() == "ctrl+c" {
 				return m, tea.Quit
 			}
 			var command tea.Cmd
-			if m.activeTab == integrityTab {
+			if m.activeTab == loaderTab {
+				m.loaderList, command = m.loaderList.Update(msg)
+			} else if m.persistenceMode == persistenceIntegrityMode {
 				m.integrityList, command = m.integrityList.Update(msg)
 			} else {
 				m.findingsList, command = m.findingsList.Update(msg)
@@ -537,8 +699,13 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.resizeComponents()
 			m.syncTables()
 			return m, tea.Batch(commands...)
-		case key.Matches(msg, m.keys.Integrity):
-			m.activeTab = integrityTab
+		case key.Matches(msg, m.keys.Processes):
+			m.activeTab = processesTab
+			m.resizeComponents()
+			m.syncTables()
+			return m, tea.Batch(commands...)
+		case key.Matches(msg, m.keys.Loader):
+			m.activeTab = loaderTab
 			m.resizeComponents()
 			m.syncTables()
 			return m, tea.Batch(commands...)
@@ -570,13 +737,56 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.resizeComponents()
 			m.syncTables()
 			return m, tea.Batch(commands...)
-		case key.Matches(msg, m.keys.Filter) && m.activeTab != persistenceTab && m.activeTab != integrityTab:
+		case key.Matches(msg, m.keys.Mode) && m.activeTab == persistenceTab:
+			if m.persistenceMode == persistenceInventoryMode {
+				m.persistenceMode = persistenceIntegrityMode
+			} else {
+				m.persistenceMode = persistenceInventoryMode
+			}
+			m.resizeComponents()
+			return m, tea.Batch(commands...)
+		case key.Matches(msg, m.keys.Mode) && m.activeTab == processesTab:
+			m.processMode = (m.processMode + 1) % processModeCount
+			if m.processMode == processLiveMode {
+				m.processSort = sortByCPU
+			} else {
+				m.processSort = sortByRisk
+			}
+			m.resizeComponents()
+			m.syncTables()
+			return m, tea.Batch(commands...)
+		case key.Matches(msg, m.keys.Mode) && m.activeTab == loaderTab:
+			m.loaderMode = (m.loaderMode + 1) % loaderModeCount
+			commands = append(commands, m.syncLoaderList())
+			m.resizeComponents()
+			return m, tea.Batch(commands...)
+		case key.Matches(msg, m.keys.Trust) && (m.activeTab == processesTab || m.activeTab == loaderTab):
+			m.trust = (m.trust + 1) % trustFilterCount
+			if m.activeTab == loaderTab {
+				commands = append(commands, m.syncLoaderList())
+			}
+			m.resizeComponents()
+			m.syncTables()
+			return m, tea.Batch(commands...)
+		case key.Matches(msg, m.keys.Sort) && m.activeTab == processesTab && m.processMode.flat():
+			m.processSort = (m.processSort + 1) % processSortCount
+			m.syncTables()
+			return m, tea.Batch(commands...)
+		case key.Matches(msg, m.keys.Collapse) && m.activeTab == processesTab && m.processMode == processTreeMode:
+			m.toggleSelectedProcess()
+			m.syncTables()
+			return m, tea.Batch(commands...)
+		case key.Matches(msg, m.keys.Legend):
+			m.legendOpen = true
+			m.resizeComponents()
+			return m, tea.Batch(commands...)
+		case key.Matches(msg, m.keys.Filter) && m.activeTab != persistenceTab && m.activeTab != loaderTab:
 			m.filterBefore = m.filter.Value()
 			m.filtering = true
 			commands = append(commands, m.filter.Focus())
 			m.resizeComponents()
 			return m, tea.Batch(commands...)
-		case key.Matches(msg, m.keys.ClearFilter) && m.activeTab != persistenceTab && m.activeTab != integrityTab:
+		case key.Matches(msg, m.keys.ClearFilter) && m.activeTab != persistenceTab && m.activeTab != loaderTab:
 			m.filter.Reset()
 			m.syncTables()
 			m.resizeComponents()
@@ -589,9 +799,13 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.help.ShowAll = !m.help.ShowAll
 			m.resizeComponents()
 			return m, tea.Batch(commands...)
-		case key.Matches(msg, m.keys.Refresh) && (m.activeTab == persistenceTab || m.activeTab == integrityTab) && !m.scanning:
+		case key.Matches(msg, m.keys.Refresh) && m.activeTab == persistenceTab && !m.scanning:
 			m.scanning = true
 			commands = append(commands, m.scanCmd())
+			return m, tea.Batch(commands...)
+		case key.Matches(msg, m.keys.Refresh) && (m.activeTab == processesTab || m.activeTab == loaderTab) && !m.runtimeScanning:
+			m.runtimeScanning = true
+			commands = append(commands, m.runtimeScanCmd())
 			return m, tea.Batch(commands...)
 		}
 	}
@@ -608,9 +822,16 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case portsTab:
 		m.portsTable, command = m.portsTable.Update(message)
 	case persistenceTab:
-		m.findingsList, command = m.findingsList.Update(message)
-	case integrityTab:
-		m.integrityList, command = m.integrityList.Update(message)
+		if m.persistenceMode == persistenceIntegrityMode {
+			m.integrityList, command = m.integrityList.Update(message)
+		} else {
+			m.findingsList, command = m.findingsList.Update(message)
+		}
+	case processesTab:
+		m.processTable, command = m.processTable.Update(message)
+		m.clampProcessScroll()
+	case loaderTab:
+		m.loaderList, command = m.loaderList.Update(message)
 	}
 	commands = append(commands, command)
 	return m, tea.Batch(commands...)
@@ -633,6 +854,26 @@ func (m Model) scanCmd() tea.Cmd {
 		}
 		result, err := m.scanner.Scan(context.Background())
 		return scanMsg{result: result, err: err}
+	}
+}
+
+func (m Model) runtimeScanCmd() tea.Cmd {
+	return func() tea.Msg {
+		if m.runtimeScanner == nil {
+			return runtimeScanMsg{err: errors.New("runtime integrity scanner is not configured")}
+		}
+		result, err := m.runtimeScanner.Scan(context.Background())
+		return runtimeScanMsg{result: result, err: err}
+	}
+}
+
+func (m Model) runtimeSampleCmd() tea.Cmd {
+	if m.runtimeSampler == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		sample, err := m.runtimeSampler.Sample(context.Background())
+		return runtimeSampleMsg{sample: sample, err: err}
 	}
 }
 
@@ -692,6 +933,30 @@ func (m *Model) recordDNSStatus(active bool, err error) {
 	})
 }
 
+// recordSampleStatus writes one record the first time live sampling reports a
+// result and again whenever its health changes, so a report shows whether the
+// process view was live without a record per interval.
+func (m *Model) recordSampleStatus(message runtimeSampleMsg) {
+	status := "active"
+	if message.err != nil {
+		status = message.err.Error()
+	}
+	if status == m.sampleStatus {
+		return
+	}
+	m.sampleStatus = status
+	m.record("runtime_sample_status", map[string]any{
+		"active":             message.err == nil,
+		"error":              errorString(message.err),
+		"observed_at":        time.Now(),
+		"visible":            message.sample.Visible,
+		"sampled":            len(message.sample.Processes),
+		"unreadable":         message.sample.UnreadableRecords,
+		"clock_ticks":        message.sample.ClockTicks,
+		"memory_total_bytes": message.sample.MemoryTotalBytes,
+	})
+}
+
 func (m *Model) record(kind string, data any) {
 	if m.recorder == nil || m.recorderErr != nil {
 		return
@@ -732,6 +997,7 @@ func errorString(err error) string {
 func (m *Model) syncTables() {
 	networkID := m.selectedNetworkID()
 	portID := selectedFlowID(m.portsTable, m.portFlows)
+	processID := selectedProcessID(m.processTable, m.processRows)
 	term := strings.ToLower(strings.TrimSpace(m.filter.Value()))
 	m.networkFlows = m.networkFlows[:0]
 	m.networkTraffic = m.networkTraffic[:0]
@@ -764,8 +1030,316 @@ func (m *Model) syncTables() {
 	if m.activeTab == dnsTab {
 		m.syncDNSTable(term)
 	}
+	m.syncProcessTable(term)
 	m.restoreNetworkSelection(networkID)
 	restoreFlowSelection(&m.portsTable, m.portFlows, portID)
+	restoreProcessSelection(&m.processTable, m.processRows, processID)
+}
+
+func (m *Model) syncProcessTable(term string) {
+	if m.processMode.flat() {
+		m.syncFlatProcessTable(term)
+		return
+	}
+	byPID := make(map[int]runtimecheck.Process, len(m.processes))
+	children := make(map[int][]runtimecheck.Process)
+	for _, process := range m.processes {
+		byPID[process.PID] = process
+		children[process.PPID] = append(children[process.PPID], process)
+	}
+	for parent := range children {
+		sort.Slice(children[parent], func(i, j int) bool { return children[parent][i].PID < children[parent][j].PID })
+	}
+	// A filtered tree keeps every ancestor of a match so the hierarchy that
+	// leads to a suspicious process stays readable.
+	filtered := term != "" || m.trust != trustAll
+	included := make(map[string]bool, len(m.processes))
+	if filtered {
+		for _, process := range m.processes {
+			if !m.processVisible(process, term) {
+				continue
+			}
+			for current, seen := process, make(map[int]bool); current.PID > 0 && !seen[current.PID]; {
+				seen[current.PID] = true
+				included[current.ID] = true
+				parent, found := byPID[current.PPID]
+				if !found {
+					break
+				}
+				current = parent
+			}
+		}
+	}
+	rows := make([]processTreeRow, 0, len(m.processes))
+	visited := make(map[string]bool, len(m.processes))
+	var hideDescendants func(int)
+	hideDescendants = func(parentPID int) {
+		for _, child := range children[parentPID] {
+			if visited[child.ID] {
+				continue
+			}
+			visited[child.ID] = true
+			hideDescendants(child.PID)
+		}
+	}
+	var walk func(runtimecheck.Process, int)
+	walk = func(process runtimecheck.Process, depth int) {
+		if visited[process.ID] {
+			return
+		}
+		visited[process.ID] = true
+		if filtered && !included[process.ID] {
+			return
+		}
+		hasChildren := len(children[process.PID]) > 0
+		collapsed := !filtered && m.collapsedProcesses[process.ID]
+		rows = append(rows, processTreeRow{process: process, depth: min(depth, 48), hasChildren: hasChildren, collapsed: collapsed})
+		if collapsed {
+			hideDescendants(process.PID)
+			return
+		}
+		for _, child := range children[process.PID] {
+			walk(child, depth+1)
+		}
+	}
+	for _, process := range m.processes {
+		if process.PPID <= 0 || process.PPID == process.PID {
+			walk(process, 0)
+			continue
+		}
+		if _, found := byPID[process.PPID]; !found {
+			walk(process, 0)
+		}
+	}
+	for _, process := range m.processes {
+		walk(process, 0)
+	}
+	m.processRows = rows
+	m.processTable.SetRows(m.rowsForProcesses(rows, m.processTable.Columns()))
+	m.clampProcessScroll()
+}
+
+// syncFlatProcessTable builds the top-style live and risk views: one row per
+// process, ranked by the active sort instead of by hierarchy.
+func (m *Model) syncFlatProcessTable(term string) {
+	rows := make([]processTreeRow, 0, len(m.processes))
+	for _, process := range m.processes {
+		if !m.processVisible(process, term) {
+			continue
+		}
+		if m.processMode == processRiskMode && !processSuspect(process) {
+			continue
+		}
+		rows = append(rows, processTreeRow{process: process})
+	}
+	m.sortProcessRows(rows, m.processSort)
+	m.processRows = rows
+	m.processTable.SetRows(m.rowsForProcesses(rows, m.processTable.Columns()))
+	m.clampProcessScroll()
+}
+
+// clampProcessScroll keeps the cursor inside the drawn window. The process
+// table is rendered here rather than by bubbles, so its scroll offset is
+// tracked here too.
+func (m *Model) clampProcessScroll() {
+	visible := max(1, m.bodyHeight()-2)
+	cursor := m.processTable.Cursor()
+	if cursor < m.processScroll {
+		m.processScroll = cursor
+	}
+	if cursor >= m.processScroll+visible {
+		m.processScroll = cursor - visible + 1
+	}
+	m.processScroll = min(m.processScroll, max(0, len(m.processRows)-visible))
+	m.processScroll = max(m.processScroll, 0)
+}
+
+func (m Model) processVisible(process runtimecheck.Process, term string) bool {
+	if term != "" && !processMatches(process, term) {
+		return false
+	}
+	return m.trust.matchesProcess(process)
+}
+
+// syncLoaderList reapplies the loader mode and trust filter to the findings
+// the last runtime scan produced.
+func (m *Model) syncLoaderList() tea.Cmd {
+	m.loaderVisible = make([]persistence.Finding, 0, len(m.loaderFindings))
+	for _, finding := range m.loaderFindings {
+		if !m.loaderMode.matches(finding) || !m.trust.matchesFinding(finding) {
+			continue
+		}
+		m.loaderVisible = append(m.loaderVisible, finding)
+	}
+	items := make([]list.Item, 0, len(m.loaderVisible))
+	for _, finding := range m.loaderVisible {
+		items = append(items, findingItem{Finding: finding})
+	}
+	m.loaderList.ResetFilter()
+	return m.loaderList.SetItems(items)
+}
+
+// applySample folds a cheap procfs sample into the live metrics and merges it
+// with the last integrity scan so processes appear and disappear immediately.
+func (m *Model) applySample(sample runtimecheck.Sample) {
+	ticks := float64(sample.ClockTicks)
+	if ticks <= 0 {
+		ticks = 100
+	}
+	elapsed := sample.CapturedAt.Sub(m.lastSample).Seconds()
+	if m.lastSample.IsZero() {
+		elapsed = 0
+	}
+	if sample.MemoryTotalBytes > 0 {
+		m.memoryTotal = sample.MemoryTotalBytes
+	}
+	metrics := make(map[string]processMetric, len(sample.Processes))
+	cpuTicks := make(map[string]uint64, len(sample.Processes))
+	for _, entry := range sample.Processes {
+		id := entry.ID()
+		metric := processMetric{
+			sampled:    true,
+			rssBytes:   entry.RSSBytes,
+			threads:    entry.Threads,
+			state:      entry.State,
+			cpuSeconds: float64(entry.CPUTicks) / ticks,
+		}
+		if m.memoryTotal > 0 {
+			metric.memPercent = float64(entry.RSSBytes) / float64(m.memoryTotal) * 100
+		}
+		previous, found := m.processCPU[id]
+		switch {
+		case found && elapsed >= 0.05 && entry.CPUTicks >= previous:
+			metric.cpuPercent = float64(entry.CPUTicks-previous) / ticks / elapsed * 100
+			metric.hasCPU = true
+		case elapsed < 0.05:
+			// Two samples landed in the same instant; keep the last usable
+			// rate rather than dividing by a near-zero interval.
+			metric.cpuPercent = m.metrics[id].cpuPercent
+			metric.hasCPU = m.metrics[id].hasCPU
+		}
+		if elapsed >= 0.05 || !found {
+			cpuTicks[id] = entry.CPUTicks
+		} else {
+			cpuTicks[id] = previous
+		}
+		metrics[id] = metric
+	}
+	m.metrics = metrics
+	m.processCPU = cpuTicks
+	if elapsed >= 0.05 || m.lastSample.IsZero() {
+		m.lastSample = sample.CapturedAt
+	}
+	m.recordSampleChurn(sample)
+	m.sampleProcesses = sample.Processes
+	m.rebuildProcesses()
+}
+
+// recordSampleChurn writes the processes that appeared or exited since the
+// previous sample. Integrity scans are minutes apart, so this is the only
+// durable record of a process that starts and exits between them.
+func (m *Model) recordSampleChurn(sample runtimecheck.Sample) {
+	if m.recorder == nil || len(m.sampleProcesses) == 0 {
+		return
+	}
+	previous := make(map[string]struct{}, len(m.sampleProcesses))
+	for _, entry := range m.sampleProcesses {
+		previous[entry.ID()] = struct{}{}
+	}
+	current := make(map[string]struct{}, len(sample.Processes))
+	for _, entry := range sample.Processes {
+		current[entry.ID()] = struct{}{}
+	}
+	for _, entry := range sample.Processes {
+		if _, found := previous[entry.ID()]; !found {
+			m.record("process_started", map[string]any{"observed_at": sample.CapturedAt, "process": entry})
+		}
+	}
+	for _, entry := range m.sampleProcesses {
+		if _, found := current[entry.ID()]; !found {
+			m.record("process_exited", map[string]any{"observed_at": sample.CapturedAt, "process": entry})
+		}
+	}
+}
+
+// rebuildProcesses joins the last integrity scan with the last live sample.
+// The sample decides which processes exist right now; the scan supplies the
+// provenance and integrity evidence for the ones it has already verified.
+func (m *Model) rebuildProcesses() {
+	if len(m.sampleProcesses) == 0 {
+		m.processes = m.scanProcesses
+		return
+	}
+	verified := make(map[string]runtimecheck.Process, len(m.scanProcesses))
+	for _, process := range m.scanProcesses {
+		verified[process.ID] = process
+	}
+	scanned := !m.lastRuntimeScan.IsZero()
+	processes := make([]runtimecheck.Process, 0, len(m.sampleProcesses))
+	for _, entry := range m.sampleProcesses {
+		process, found := verified[entry.ID()]
+		if !found {
+			processes = append(processes, sampledProcess(entry, scanned))
+			continue
+		}
+		if entry.State != "" {
+			process.State = entry.State
+		}
+		processes = append(processes, process)
+	}
+	m.processes = processes
+}
+
+func processMatches(process runtimecheck.Process, term string) bool {
+	values := []string{
+		process.ID,
+		strconv.Itoa(process.PID),
+		strconv.Itoa(process.PPID),
+		process.Name,
+		process.User,
+		process.Executable,
+		process.Command,
+		process.Service,
+		string(process.Provenance),
+		process.Package,
+		process.Integrity,
+		process.Reason,
+		strings.Join(process.Flags, " "),
+	}
+	return strings.Contains(strings.ToLower(strings.Join(values, " ")), term)
+}
+
+func selectedProcessID(component table.Model, rows []processTreeRow) string {
+	index := component.Cursor()
+	if index < 0 || index >= len(rows) {
+		return ""
+	}
+	return rows[index].process.ID
+}
+
+func restoreProcessSelection(component *table.Model, rows []processTreeRow, id string) {
+	if id != "" {
+		for index := range rows {
+			if rows[index].process.ID == id {
+				component.SetCursor(index)
+				return
+			}
+		}
+	}
+	clampTableCursor(component, len(rows))
+}
+
+func (m *Model) toggleSelectedProcess() {
+	index := m.processTable.Cursor()
+	if index < 0 || index >= len(m.processRows) || !m.processRows[index].hasChildren {
+		return
+	}
+	id := m.processRows[index].process.ID
+	if m.collapsedProcesses[id] {
+		delete(m.collapsedProcesses, id)
+	} else {
+		m.collapsedProcesses[id] = true
+	}
 }
 
 func (m *Model) syncDNSTable(term string) {
@@ -1096,17 +1670,31 @@ func (m *Model) openSelectedDetail() {
 			content = m.renderDNSEventDetail(m.dnsEvents[index])
 		}
 	case persistenceTab:
-		item, ok := m.findingsList.SelectedItem().(findingItem)
+		component := m.findingsList
+		title := "Persistence Evidence"
+		if m.persistenceMode == persistenceIntegrityMode {
+			component = m.integrityList
+			title = "Persistence Integrity Evidence"
+		}
+		item, ok := component.SelectedItem().(findingItem)
 		if ok {
-			m.detailTitle = "Persistence Evidence"
+			m.detailTitle = title
 			m.detailFindingID = item.ID
 			content = m.renderFindingDetail(item.Finding)
 		}
-	case integrityTab:
-		item, ok := m.integrityList.SelectedItem().(findingItem)
+	case processesTab:
+		index := m.processTable.Cursor()
+		if index >= 0 && index < len(m.processRows) {
+			process := m.processRows[index].process
+			m.detailTitle = "Process Evidence"
+			m.detailProcessID = process.ID
+			content = m.renderProcessDetail(process)
+		}
+	case loaderTab:
+		item, ok := m.loaderList.SelectedItem().(findingItem)
 		if ok {
-			m.detailTitle = "Integrity Evidence"
-			m.detailFindingID = item.ID
+			m.detailTitle = "Loader Integrity Evidence"
+			m.detailLoaderID = item.ID
 			content = m.renderFindingDetail(item.Finding)
 		}
 	}
@@ -1179,16 +1767,49 @@ func (m *Model) refreshDetailContent() {
 		}
 		m.detail.SetContent(m.styles.warning.Render("This persistence entry was not present in the latest scan."))
 		m.detail.GotoTop()
+		return
+	}
+	if m.detailProcessID != "" {
+		for _, process := range m.processes {
+			if process.ID == m.detailProcessID {
+				m.detail.SetContent(m.renderProcessDetail(process))
+				m.detail.SetYOffset(offset)
+				return
+			}
+		}
+		m.detail.SetContent(m.styles.warning.Render("This process was not present in the latest runtime scan."))
+		m.detail.GotoTop()
+		return
+	}
+	if m.detailLoaderID != "" {
+		for _, finding := range m.loaderFindings {
+			if finding.ID == m.detailLoaderID {
+				m.detail.SetContent(m.renderFindingDetail(finding))
+				m.detail.SetYOffset(offset)
+				return
+			}
+		}
+		m.detail.SetContent(m.styles.warning.Render("This loader finding was not present in the latest runtime scan."))
+		m.detail.GotoTop()
 	}
 }
 
 func (m Model) ShortHelp() []key.Binding {
-	if m.activeTab == persistenceTab || m.activeTab == integrityTab {
+	if m.activeTab == persistenceTab {
 		filterKey := m.findingsList.KeyMap.Filter
-		if m.activeTab == integrityTab {
+		if m.persistenceMode == persistenceIntegrityMode {
 			filterKey = m.integrityList.KeyMap.Filter
 		}
-		return []key.Binding{m.keys.NextTab, m.keys.Detail, filterKey, m.keys.Refresh, m.keys.Help, m.keys.Quit}
+		return []key.Binding{m.keys.NextTab, m.keys.Mode, m.keys.Detail, filterKey, m.keys.Refresh, m.keys.Legend, m.keys.Help, m.keys.Quit}
+	}
+	if m.activeTab == loaderTab {
+		return []key.Binding{m.keys.NextTab, m.keys.Mode, m.keys.Trust, m.keys.Detail, m.loaderList.KeyMap.Filter, m.keys.Refresh, m.keys.Legend, m.keys.Quit}
+	}
+	if m.activeTab == processesTab {
+		if m.processMode.flat() {
+			return []key.Binding{m.keys.NextTab, m.keys.Mode, m.keys.Trust, m.keys.Sort, m.keys.Detail, m.keys.Filter, m.keys.Refresh, m.keys.Legend, m.keys.Quit}
+		}
+		return []key.Binding{m.keys.NextTab, m.keys.Mode, m.keys.Trust, m.keys.Detail, m.keys.Collapse, m.keys.Filter, m.keys.Refresh, m.keys.Legend, m.keys.Quit}
 	}
 	if isNetworkTab(m.activeTab) || m.activeTab == dnsTab {
 		return []key.Binding{m.keys.NextTab, m.keys.Mode, m.keys.Detail, m.keys.Filter, m.keys.Pause, m.keys.Help, m.keys.Quit}
@@ -1198,9 +1819,9 @@ func (m Model) ShortHelp() []key.Binding {
 
 func (m Model) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
-		{m.keys.NextTab, m.keys.PreviousTab, m.keys.Inbound, m.keys.Outbound, m.keys.DNS, m.keys.Ports, m.keys.Persistence, m.keys.Integrity},
-		{m.keys.Detail, m.keys.Back, m.keys.Filter, m.keys.ClearFilter, m.keys.Refresh},
-		{m.keys.Mode, m.keys.Pause, m.keys.Help, m.keys.Quit},
+		{m.keys.NextTab, m.keys.PreviousTab, m.keys.Inbound, m.keys.Outbound, m.keys.DNS, m.keys.Ports, m.keys.Persistence, m.keys.Processes, m.keys.Loader},
+		{m.keys.Detail, m.keys.Back, m.keys.Filter, m.keys.ClearFilter, m.keys.Refresh, m.keys.Collapse},
+		{m.keys.Mode, m.keys.Trust, m.keys.Sort, m.keys.Pause, m.keys.Legend, m.keys.Help, m.keys.Quit},
 	}
 }
 
@@ -1209,8 +1830,11 @@ func (m Model) errorText() string {
 	if (isNetworkTab(m.activeTab) || m.activeTab == portsTab) && m.collectorErr != nil {
 		parts = append(parts, "network: "+m.collectorErr.Error())
 	}
-	if (m.activeTab == persistenceTab || m.activeTab == integrityTab) && m.scannerErr != nil {
+	if m.activeTab == persistenceTab && m.scannerErr != nil {
 		parts = append(parts, "persistence: "+m.scannerErr.Error())
+	}
+	if (m.activeTab == processesTab || m.activeTab == loaderTab) && m.runtimeScannerErr != nil {
+		parts = append(parts, "runtime: "+m.runtimeScannerErr.Error())
 	}
 	if m.activeTab == dnsTab && m.dnsErr != nil {
 		parts = append(parts, "dns: "+m.dnsErr.Error())

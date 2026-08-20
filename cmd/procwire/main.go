@@ -13,17 +13,19 @@ import (
 	"github.com/xhzeem/procwire/internal/observe"
 	"github.com/xhzeem/procwire/internal/persistence"
 	"github.com/xhzeem/procwire/internal/report"
+	"github.com/xhzeem/procwire/internal/runtimecheck"
 	"github.com/xhzeem/procwire/internal/tui"
 )
 
 var version = "dev"
 
 type options struct {
-	interval  time.Duration
-	duration  time.Duration
-	output    string
-	noReport  bool
-	showBuild bool
+	interval      time.Duration
+	duration      time.Duration
+	runtimeRescan time.Duration
+	output        string
+	noReport      bool
+	showBuild     bool
 }
 
 func main() {
@@ -75,6 +77,7 @@ func run() (returnErr error) {
 			"os":               runtime.GOOS,
 			"architecture":     runtime.GOARCH,
 			"polling_interval": options.interval.String(),
+			"runtime_rescan":   options.runtimeRescan.String(),
 		}); err != nil {
 			return err
 		}
@@ -96,16 +99,26 @@ func run() (returnErr error) {
 		}
 	}
 
+	runtimeRescan := options.runtimeRescan
+	if runtimeRescan <= 0 {
+		// A zero flag value disables automatic rescans. The model reads any
+		// negative interval as "never" and only defaults an unset zero.
+		runtimeRescan = -1
+	}
+
 	model := tui.New(tui.Config{
-		Collector:  observe.NewCollector(),
-		DNSMonitor: dnsMonitor,
-		DNSError:   dnsErr,
-		Scanner:    persistence.NewScanner(),
-		Recorder:   optionalRecorder(recorder),
-		ReportPath: reportPath,
-		Interval:   options.interval,
-		RunFor:     options.duration,
-		Version:    version,
+		Collector:      observe.NewCollector(),
+		DNSMonitor:     dnsMonitor,
+		DNSError:       dnsErr,
+		Scanner:        persistence.NewScanner(),
+		RuntimeScanner: runtimecheck.NewScanner(),
+		RuntimeSampler: runtimecheck.NewSampler(),
+		Recorder:       optionalRecorder(recorder),
+		ReportPath:     reportPath,
+		Interval:       options.interval,
+		RunFor:         options.duration,
+		RuntimeRescan:  runtimeRescan,
+		Version:        version,
 	})
 	program := tea.NewProgram(model, tea.WithAltScreen())
 	if _, err := program.Run(); err != nil {
@@ -137,6 +150,7 @@ func parseFlags() options {
 	var options options
 	flag.DurationVar(&options.interval, "interval", time.Second, "procfs polling interval")
 	flag.DurationVar(&options.duration, "duration", 0, "exit automatically after this duration")
+	flag.DurationVar(&options.runtimeRescan, "runtime-rescan", 30*time.Second, "interval between process and loader integrity rescans (0 disables)")
 	flag.StringVar(&options.output, "output", "", "new JSONL report path (default: current directory)")
 	flag.BoolVar(&options.noReport, "no-report", false, "disable JSONL session recording")
 	flag.BoolVar(&options.showBuild, "version", false, "print version and exit")

@@ -21,11 +21,22 @@ ProcWire is under active development. Network socket state currently comes from 
 - Automatic pure-Go `AF_PACKET` fallback for kernels or sandboxes that reject the eBPF programs.
 - A DNS tab with an alphabetically stable Current cache and a retained event-by-event History, plus TTL-aware observed answers, `/etc/hosts` entries, and DNS-derived network destination names.
 - Dedicated open-port view for TCP listeners and unconnected UDP bound sockets.
+- Complete inventory of every visible process, arranged as a collapsible parent/child tree with PID, user, service, executable, and command attribution.
+- Three Processes modes on one key: the integrity Tree, a `top`-style Live view ranked by live CPU and memory, and a Risk view that isolates only the processes carrying a runtime integrity flag and shows why.
+- Continuous live process sampling at the polling interval, adding per-process CPU share, resident memory, memory share, CPU time, thread count, and scheduler state without waiting for the next integrity scan.
+- Processes that start after the last integrity scan appear immediately, flagged `NEW` and labeled `PENDING` until they are verified; processes that exit disappear on the next sample.
+- `process_started` and `process_exited` JSONL records for every process that appears or exits between integrity scans, including short-lived ones.
+- A composite 0-99 risk score per process, combining review level, package provenance, and runtime flags, used to rank the Live and Risk views, marked `!!` or `!` in every row, and coloured as a five-step ramp: baseline, review, elevated, warning, critical.
+- Per-cell colour in the process table: every trust label has its own colour, every account has its own stable colour with root pinned, and CPU, memory, flag, and scheduler-state cells shift colour as they become notable.
+- A shared trust filter across the Processes and Loader Integrity tabs, narrowing either view to Suspect, Warning-only, or Unpackaged entries while keeping tree ancestry readable.
+- Live executable verification through `/proc/<pid>/exe`, with package provenance and explicit root, capability, deleted, replaced, memory-backed, temporary-path, writable, traced, new, and kernel-thread flags.
+- Loader Integrity view for `/etc/ld.so.preload`, selected loader environment controls, executable W+X/anonymous/memfd/deleted mappings, volatile mapped objects, and mapped paths that differ from local package metadata, filterable to injection controls or executable mappings alone.
+- Automatic process and loader integrity rescans on a fixed interval, so provenance evidence catches up with the live process set without any keypress.
 - Inventory of system and user systemd services, timers, sockets, paths, mounts, automounts, swaps, drop-ins, masks, and shadowed definitions.
 - Coverage of systemd control, attached, transient, generator, vendor, administrator, XDG, and discovered per-user unit directories.
 - Inventory of system crontabs, user crontabs, anacron entries, and periodic cron directories.
 - Native package-manifest verification for dpkg, pacman, and apk without invoking package-manager commands.
-- Dedicated Integrity tab that provides a native `debsums -s`-style view of modified, local, generated, digest-less, and unverifiable persistence files.
+- Persistence Inventory and Integrity modes, with the Integrity mode providing a native `debsums -s`-style view of modified, local, generated, digest-less, and unverifiable persistence files.
 - Automatic private JSONL recording with flow lifecycle, DNS, collector status, and persistence events.
 - Single statically linked Linux ELF release builds with no shared-library or helper-command requirement.
 
@@ -44,16 +55,16 @@ ProcWire colors persistence entries by evidence source:
 
 These labels deliberately do not say “malware” or “official.” A package match proves only that a file matches the local package database. A privileged attacker could modify both the file and that database. Stronger assurance requires trusted boot, IMA, remote attestation, or comparison against independently obtained signed packages.
 
-The Integrity tab is broader than the real `debsums -s`: it also includes unowned local files, generated entries, and files that cannot be checked safely. ProcWire implements this natively so `debsums` does not need to be installed.
+The Persistence Integrity mode is broader than the real `debsums -s`: it also includes unowned local files, generated entries, and files that cannot be checked safely. ProcWire implements this natively so `debsums` does not need to be installed.
 
 ## Quick Start
 
-Download the `v0.1.2` binary for your Linux architecture:
+Download the `v0.2.0` binary for your Linux architecture:
 
 ### AMD64 / x86_64
 
 ```sh
-curl -fL https://github.com/xhzeem/procwire/releases/download/v0.1.2/procwire-linux-amd64 -o procwire
+curl -fL https://github.com/xhzeem/procwire/releases/download/v0.2.0/procwire-linux-amd64 -o procwire
 chmod +x procwire
 sudo ./procwire
 ```
@@ -61,7 +72,7 @@ sudo ./procwire
 ### ARM64 / AArch64
 
 ```sh
-curl -fL https://github.com/xhzeem/procwire/releases/download/v0.1.2/procwire-linux-arm64 -o procwire
+curl -fL https://github.com/xhzeem/procwire/releases/download/v0.2.0/procwire-linux-arm64 -o procwire
 chmod +x procwire
 sudo ./procwire
 ```
@@ -83,24 +94,30 @@ Useful options:
 --output PATH       create a new JSONL report at PATH
 --no-report         disable recording
 --duration 30s      exit automatically after a fixed duration
+--runtime-rescan 30s
+                    process and loader integrity rescan interval (0 disables)
 --version           print build information
 ```
 
-By default, ProcWire creates a file such as `procwire-20260816-120000.jsonl` in the launch directory. Reports use mode `0600` and are never silently overwritten. They can contain sensitive endpoints, executable paths, and command lines.
+By default, ProcWire creates a file such as `procwire-20260816-120000.jsonl` in the launch directory. Reports use mode `0600` and are never silently overwritten. They can contain sensitive endpoints, executable paths, command lines, and selected loader environment values.
 
 ## Keys
 
 | Key | Action |
 | --- | --- |
-| `1`, `2`, `3`, `4`, `5`, `6` | Open Inbound, Outbound, DNS, Open Ports, Persistence, or Integrity. |
+| `1`, `2`, `3`, `4`, `5`, `6`, `7` | Open Inbound, Outbound, DNS, Open Ports, Persistence, Processes, or Loader Integrity. |
 | `tab`, `shift+tab` | Move between tabs. |
 | `j`, `k`, arrows | Move through rows. |
 | `enter` | Open evidence and attribution details. |
 | `/` | Filter the current view. |
-| `m` | Toggle Inbound/Outbound Live/Session or DNS Current/History. |
+| `m` | Switch the mode of the current tab: Inbound/Outbound Live/Session, DNS Current/History, Persistence Inventory/Integrity, Processes Tree/Live/Risk, or Loader All/Injection/Mappings. |
+| `t` | Cycle the trust filter on Processes and Loader Integrity: All, Suspect, Warning, Unpackaged. |
+| `s` | Cycle the sort in the Processes Live and Risk views: Risk, CPU, Memory, PID, Name. |
+| `space` | Collapse or expand the selected branch in the Processes tree. |
+| `l` | Open the label, review-level, risk-score colour ramp, and process-flag legend. |
 | `c` | Clear the network, DNS, or port filter. |
 | `p` | Freeze or resume visible live-data rows. Collection and recording continue while paused. |
-| `r` | Rescan persistence entries. |
+| `r` | Rescan Persistence, or force an immediate Processes and Loader Integrity rescan from the selected tab. |
 | `?` | Expand or collapse help. |
 | `q`, `ctrl+c` | Exit. |
 
@@ -136,11 +153,19 @@ The generator publishes a JSON fixture manifest instead of sharing hardcoded por
 - Flow-close events after the generator exits, with repeated observations proving polling stability.
 - Detection of two randomized local services, two linked timers, and two cron mechanisms.
 - Detection of a modified package-owned systemd file identified through its canonical path in the manifest.
+- Process-tree inventory of the traffic generator and detection of its controlled loader environment override.
+- Active live process sampling reporting at least one sampled process.
 - A clean `session_end` record and a static ELF with no dynamic interpreter.
 
 ## Current Limits
 
 - Procfs polling can miss short-lived connections between snapshots.
+- Package provenance for a process is only as current as the last integrity scan (30s by default, or `r` on demand). Live sampling shows a new process immediately, but labels it `PENDING` until that scan verifies it.
+- Live sampling reads `/proc/<pid>/stat` once per interval, so a process that starts and exits entirely between two samples is still missed. The CPU share is an average over the interval, not an instantaneous rate.
+- The risk score ranks what to inspect first. It is a triage ordinal derived from the same evidence shown in the row, not a verdict, a detection, or a confidence value. Its colour band is the same ordinal, not a severity claim.
+- Account colours are a stable hash over six colours, so two accounts on a busy host can share one. They separate accounts within a view; they do not identify one.
+- Process visibility is limited to the mounted procfs/PID namespaces. Package manifests are isolated by visible process mount namespace and root inode, but inaccessible foreign roots remain unverified.
+- Loader checks inspect preload configuration, selected initial process environment values, and executable map metadata. They do not compare every in-memory page, and legitimate JIT runtimes or package upgrades can produce review findings.
 - Only the current network namespace is inspected; separate container namespaces are not traversed yet.
 - DNS visibility covers plaintext UDP/TCP port 53. DoH and DoT are encrypted, and TCP messages split across packets are not reassembled yet.
 - Kernel helper incompatibilities first retry reduced-attribution eBPF; other eBPF load failures fall back to `AF_PACKET` in the current network namespace without reliable PID/cgroup attribution.

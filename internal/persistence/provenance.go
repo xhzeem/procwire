@@ -35,6 +35,18 @@ type packageVerifier interface {
 	Verify(string) verification
 }
 
+// FileVerifier exposes package-manifest checks to other host inventory
+// collectors without exposing the package database implementation.
+type FileVerifier interface {
+	Name() string
+	Verify(string) FileEvidence
+	VerifyContent(string, io.Reader) FileEvidence
+}
+
+type exportedFileVerifier struct {
+	inner packageVerifier
+}
+
 type manifestVerifier struct {
 	name       string
 	root       string
@@ -79,37 +91,44 @@ func newNativePackageVerifier(root string) (packageVerifier, []string) {
 	return unknownVerifier{detail: "no supported native package manifest was found"}, nil
 }
 
+// NewFileVerifier loads the native package manifest rooted at root. VerifyContent
+// compares an already-open live file, such as /proc/PID/exe, with that manifest.
+func NewFileVerifier(root string) (FileVerifier, []string) {
+	verifier, warnings := newNativePackageVerifier(root)
+	return exportedFileVerifier{inner: verifier}, warnings
+}
+
+func (v exportedFileVerifier) Name() string { return v.inner.Name() }
+
+func (v exportedFileVerifier) Verify(path string) FileEvidence {
+	return fileEvidence(path, v.inner.Verify(path))
+}
+
+func (v exportedFileVerifier) VerifyContent(path string, content io.Reader) FileEvidence {
+	if verifier, ok := v.inner.(interface {
+		VerifyContent(string, io.Reader) verification
+	}); ok {
+		return fileEvidence(path, verifier.VerifyContent(path, content))
+	}
+	return fileEvidence(path, v.inner.Verify(path))
+}
+
+func fileEvidence(path string, verified verification) FileEvidence {
+	return FileEvidence{
+		Path:           path,
+		Provenance:     verified.provenance,
+		Package:        verified.packageName,
+		PackageManager: verified.manager,
+		Integrity:      verified.detail,
+	}
+}
+
 func (v *manifestVerifier) Name() string { return v.name }
 
 func (v *manifestVerifier) Verify(path string) verification {
-	path = normalizeManifestPath(path)
-	record, found := v.records[path]
+	path, record, result, found := v.lookup(path)
 	if !found {
-		for _, alias := range manifestAliases(v.root, path) {
-			if record, found = v.records[alias]; found {
-				break
-			}
-		}
-	}
-	if !found {
-		if v.incomplete {
-			return verification{
-				provenance: ProvenanceUnverified,
-				manager:    v.name,
-				detail:     "package metadata was only partially readable, so path ownership cannot be established",
-			}
-		}
-		return verification{
-			provenance: ProvenanceLocal,
-			manager:    v.name,
-			detail:     "path is not owned by any entry in the local package manifest",
-		}
-	}
-	result := verification{
-		provenance:  ProvenancePackageOwned,
-		manager:     v.name,
-		packageName: record.packageName,
-		detail:      "path is owned by an installed package, but no file digest is available",
+		return result
 	}
 	if record.algorithm == "" || len(record.digest) == 0 {
 		return result
@@ -138,6 +157,59 @@ func (v *manifestVerifier) Verify(path string) verification {
 	result.provenance = ProvenancePackageMatch
 	result.detail = fmt.Sprintf("%s digest matches the local %s package manifest", strings.ToUpper(record.algorithm), v.name)
 	return result
+}
+
+func (v *manifestVerifier) VerifyContent(path string, content io.Reader) verification {
+	_, record, result, found := v.lookup(path)
+	if !found || record.algorithm == "" || len(record.digest) == 0 {
+		return result
+	}
+	digest, err := digestReader(content, record.algorithm)
+	if err != nil {
+		result.provenance = ProvenanceUnverified
+		result.detail = "could not hash live package-owned content: " + err.Error()
+		return result
+	}
+	if !bytes.Equal(digest, record.digest) {
+		result.provenance = ProvenancePackageModified
+		result.detail = fmt.Sprintf("live file digest does not match the local %s package manifest", v.name)
+		return result
+	}
+	result.provenance = ProvenancePackageMatch
+	result.detail = fmt.Sprintf("live %s digest matches the local %s package manifest", strings.ToUpper(record.algorithm), v.name)
+	return result
+}
+
+func (v *manifestVerifier) lookup(path string) (string, packageRecord, verification, bool) {
+	path = normalizeManifestPath(path)
+	record, found := v.records[path]
+	if !found {
+		for _, alias := range manifestAliases(v.root, path) {
+			if record, found = v.records[alias]; found {
+				break
+			}
+		}
+	}
+	if !found {
+		if v.incomplete {
+			return path, packageRecord{}, verification{
+				provenance: ProvenanceUnverified,
+				manager:    v.name,
+				detail:     "package metadata was only partially readable, so path ownership cannot be established",
+			}, false
+		}
+		return path, packageRecord{}, verification{
+			provenance: ProvenanceLocal,
+			manager:    v.name,
+			detail:     "path is not owned by any entry in the local package manifest",
+		}, false
+	}
+	return path, record, verification{
+		provenance:  ProvenancePackageOwned,
+		manager:     v.name,
+		packageName: record.packageName,
+		detail:      "path is owned by an installed package, but no file digest is available",
+	}, true
 }
 
 func loadDPKGVerifier(root string) (*manifestVerifier, error) {
@@ -423,6 +495,15 @@ func (v *manifestVerifier) warn(format string, values ...any) {
 }
 
 func digestFile(path, algorithm string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return digestReader(file, algorithm)
+}
+
+func digestReader(reader io.Reader, algorithm string) ([]byte, error) {
 	var digest hash.Hash
 	switch algorithm {
 	case "md5":
@@ -434,12 +515,7 @@ func digestFile(path, algorithm string) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("unsupported digest algorithm %q", algorithm)
 	}
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	if _, err := io.Copy(digest, file); err != nil {
+	if _, err := io.Copy(digest, reader); err != nil {
 		return nil, err
 	}
 	result := digest.Sum(nil)
